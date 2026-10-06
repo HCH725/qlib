@@ -30,9 +30,7 @@ def test_qlib_backtest_dca_entrypoint_uses_each_stage_entry_timestamp():
     assert len(ledger) == 9
     assert ledger.index[-1] == 1642536000.0
     assert ledger["close"].iloc[-1] == 141.19
-    expected_average = float(
-        sum(amounts_quote[level] * prices[level] for level in range(4)) / sum(amounts_quote[:4])
-    )
+    expected_average = float(sum(amounts_quote[level] * prices[level] for level in range(4)) / sum(amounts_quote[:4]))
     assert abs(ledger["current_position_average_price"].iloc[-1] - expected_average) < 1e-8
 
     assert ledger["filled_amount_quote_0"].tolist() == [1000.0] * 9
@@ -66,3 +64,127 @@ def test_decimal_threshold_comparison_matches_pinned_simulator():
 
     assert close_type == "TIME_LIMIT"
     assert ledger["filled_amount_quote"].tolist() == [0.0, 0.0, 0.0]
+
+
+def test_sell_dca_uses_upward_levels_and_high_for_stop_loss():
+    timestamps = [1000.0, 2000.0, 3000.0, 4000.0]
+    closes = [110.0, 120.0, 114.0, 116.0]
+    candles = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "close": closes,
+            "low": closes,
+            "high": [110.0, 120.0, 127.0, 118.0],
+        },
+        index=pd.Index(timestamps, name="timestamp"),
+    )
+
+    ledger, close_type = backtest_hummingbot_dca(
+        candles,
+        [Decimal("110"), Decimal("120")],
+        [Decimal("100"), Decimal("100")],
+        take_profit=None,
+        stop_loss=Decimal("0.05"),
+        trade_cost=0,
+        side="SELL",
+    )
+
+    assert close_type == "STOP_LOSS"
+    assert ledger.index.tolist() == timestamps[:3]
+    assert ledger["filled_amount_quote_0"].tolist() == [100.0] * 3
+    assert ledger["filled_amount_quote_1"].tolist() == [0.0, 100.0, 100.0]
+    assert ledger["current_position_average_price"].iloc[-1] == 115.0
+
+
+def test_buy_trailing_stop_uses_cumulative_high_trigger():
+    timestamps = [1000.0, 2000.0, 3000.0, 4000.0]
+    closes = [100.0, 105.0, 110.0, 107.0]
+    candles = pd.DataFrame(
+        {"timestamp": timestamps, "close": closes, "low": closes, "high": closes},
+        index=pd.Index(timestamps, name="timestamp"),
+    )
+
+    ledger, close_type = backtest_hummingbot_dca(
+        candles,
+        [Decimal("100")],
+        [Decimal("100")],
+        take_profit=None,
+        stop_loss=Decimal("0.50"),
+        trade_cost=0,
+        trailing_stop={"activation_price": Decimal("0.05"), "trailing_delta": Decimal("0.02")},
+    )
+
+    assert close_type == "TRAILING_STOP"
+    assert ledger.index.tolist() == timestamps
+    assert ledger["filled_amount_quote_0"].tolist() == [100.0] * 4
+
+
+def test_sell_trailing_stop_uses_cumulative_low_trigger():
+    timestamps = [1000.0, 2000.0, 3000.0, 4000.0]
+    closes = [100.0, 95.0, 90.0, 93.0]
+    candles = pd.DataFrame(
+        {"timestamp": timestamps, "close": closes, "low": closes, "high": closes},
+        index=pd.Index(timestamps, name="timestamp"),
+    )
+
+    ledger, close_type = backtest_hummingbot_dca(
+        candles,
+        [Decimal("100")],
+        [Decimal("100")],
+        take_profit=None,
+        stop_loss=Decimal("0.50"),
+        trade_cost=0,
+        side="SELL",
+        trailing_stop={"activation_price": Decimal("0.05"), "trailing_delta": Decimal("0.02")},
+    )
+
+    assert close_type == "TRAILING_STOP"
+    assert ledger.index.tolist() == timestamps
+    assert ledger["filled_amount_quote_0"].tolist() == [100.0] * 4
+
+
+def test_time_limit_filters_after_the_signal_timestamp():
+    timestamps = [1000.0, 2000.0, 3000.0, 4000.0]
+    closes = [100.0, 101.0, 102.0, 103.0]
+    candles = pd.DataFrame(
+        {"timestamp": timestamps, "close": closes, "low": closes},
+        index=pd.Index(timestamps, name="timestamp"),
+    )
+
+    ledger, close_type = backtest_hummingbot_dca(
+        candles,
+        [Decimal("100")],
+        [Decimal("100")],
+        take_profit=None,
+        stop_loss=Decimal("0.10"),
+        trade_cost=0,
+        time_limit=2000,
+    )
+
+    assert close_type == "TIME_LIMIT"
+    assert ledger.index.tolist() == timestamps[:3]
+    assert ledger["filled_amount_quote_0"].tolist() == [100.0] * 3
+
+
+def test_taker_mode_matches_hummingbot_unsupported_behavior():
+    timestamps = [1000.0, 2000.0]
+    closes = [100.0, 100.0]
+    candles = pd.DataFrame(
+        {"timestamp": timestamps, "close": closes, "low": closes},
+        index=pd.Index(timestamps, name="timestamp"),
+    )
+
+    try:
+        backtest_hummingbot_dca(
+            candles,
+            [Decimal("100")],
+            [Decimal("100")],
+            take_profit=Decimal("0.02"),
+            stop_loss=Decimal("0.05"),
+            trade_cost=0.0002,
+            mode="TAKER",
+        )
+    except NotImplementedError as error:
+        assert str(error) == "Taker mode is not supported in DCAExecutorSimulator"
+    else:
+        raise AssertionError("TAKER mode must remain unsupported")

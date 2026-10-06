@@ -22,6 +22,7 @@ from ..utils import init_instance_by_config
 from .backtest import INDICATOR_METRIC, PORT_METRIC, backtest_loop, collect_data_loop
 from .decision import Order
 from .exchange import Exchange
+from .hummingbot_dca import simulate_hummingbot_dca as backtest_hummingbot_dca
 from .utils import CommonInfrastructure
 
 # make import more user-friendly by adding `from qlib.backtest import STH`
@@ -346,4 +347,4 @@ def format_decisions(
     return res
 
 
-__all__ = ["Order", "backtest", "get_strategy_executor"]
+__all__ = ["Order", "backtest", "backtest_hummingbot_dca", "get_strategy_executor"]

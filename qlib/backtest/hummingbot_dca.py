@@ -102,6 +102,7 @@ def simulate_hummingbot_dca(
         df_filtered[f"net_pnl_quote_{level}"] = 0.0
         potential_stages.append(
             {
+                "entry_timestamp": entry_timestamp,
                 "amount": float(amount),
                 "break_even_price": float(break_even_price),
                 "close_timestamp": close_timestamp,
@@ -114,14 +115,12 @@ def simulate_hummingbot_dca(
         return df_filtered, "TIME_LIMIT"
 
     close_type = None
-    # ponytail: Preserve the pinned simulator's last-probed entry timestamp. If
-    # the next DCA level is never reached it is NaN, so the reference materializes
-    # no fills; switching to per-stage timestamps needs an explicit parity change.
     for level, stage in enumerate(potential_stages):
-        if not pd.isna(entry_timestamp):
-            df_filtered.loc[entry_timestamp:, f"filled_amount_quote_{level}"] = stage["amount"]
-            df_filtered.loc[entry_timestamp:, f"net_pnl_quote_{level}"] = stage["cumulative_returns"] * stage["amount"]
-            df_filtered.loc[entry_timestamp:, "current_position_average_price"] = stage["break_even_price"]
+        stage_entry_timestamp = stage["entry_timestamp"]
+        if not pd.isna(stage_entry_timestamp):
+            df_filtered.loc[stage_entry_timestamp:, f"filled_amount_quote_{level}"] = stage["amount"]
+            df_filtered.loc[stage_entry_timestamp:, f"net_pnl_quote_{level}"] = stage["cumulative_returns"] * stage["amount"]
+            df_filtered.loc[stage_entry_timestamp:, "current_position_average_price"] = stage["break_even_price"]
         if stage["close_type"] is not None:
             close_type = stage["close_type"]
             last_timestamp = stage["close_timestamp"]

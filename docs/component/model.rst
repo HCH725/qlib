@@ -110,11 +110,33 @@ Also, the above example has been given in ``examples/train_backtest_analyze.ipyn
 Technically, the meaning of the model prediction depends on the label setting designed by user.
 By default, the meaning of the score is normally the rating of the instruments by the forecasting model. The higher the score, the more profit the instruments.
 
+Reloading a saved model
+=======================
+
+Training and prediction with in-memory objects, as above, do not require a recorder
+trust grant. Reloading a saved model or dataset may execute Python code, however.
+For artifacts from a verified writer in an access-controlled store, explicitly use
+``recorder.load_object("params.pkl", trusted=True)`` (or the corresponding ``R``
+facade). Keep prediction and label data reads restricted by omitting ``trusted``.
+Do not automatically retry a refused load with unrestricted deserialization.
+
+Workflows that resume training can configure ``DelayTrainerR`` or
+``DelayTrainerRM`` with ``trusted=True`` at construction, rather than
+changing internal loads. See :ref:`artifact_loading_migration` for migration details,
+version limitations and the separate trust requirements of local pickle files.
+
 
 Custom Model
 ============
 
 Qlib supports custom models. If users are interested in customizing their own models and integrating the models into ``Qlib``, please refer to `Custom Model Integration <../start/integration.html>`_.
+
+See :ref:`config_migration` when upgrading file-based models: each ``.py``
+component needs its own top-level boolean ``trusted`` declaration, while
+package imports remain available. The guide also covers trusted older
+file-model pickles and registering custom built-in TRA backbones through
+``qlib.contrib.model.pytorch_tra.MODEL_TYPES`` before construction, including
+in workers.
 
 
 API

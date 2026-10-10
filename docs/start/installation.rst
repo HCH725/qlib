@@ -6,6 +6,26 @@ Installation
 
 .. currentmodule:: qlib
 
+.. important::
+
+   Upgrading an existing workflow? Read :ref:`config_migration` before using
+   local Python modules, custom expressions, or extension registries. The guide
+   describes unreleased source changes; a PR checkout, ``main``, and a tagged
+   or PyPI release can differ. Use examples and documentation matching your
+   installed revision.
+
+
+.. important::
+
+   **Unreleased upgrade notice for new source builds:** recorder artifact loading
+   is restricted by default. Reloading executable models, datasets or workflow
+   objects requires explicit ``trusted=True`` after verifying their source and
+   storage; supported data-only reads and fresh in-memory training need no opt-in.
+   Follow :ref:`artifact_loading_migration` before upgrading existing workflows.
+   Merging into ``main`` affects source installs before a new PyPI release.
+   This change is unreleased until included in a tagged release, whose upgrade
+   notes should link to that guide.
+
 
 ``Qlib`` Installation
 =====================

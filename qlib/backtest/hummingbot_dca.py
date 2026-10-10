@@ -14,8 +14,8 @@ def simulate_hummingbot_dca(
     take_profit: Optional[Decimal],
     stop_loss: Optional[Decimal],
     trade_cost: float,
-    side="BUY",
-    mode="MAKER",
+    side: object = "BUY",
+    mode: object = "MAKER",
     trailing_stop: Optional[object] = None,
     time_limit: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, str]:
@@ -111,15 +111,15 @@ def simulate_hummingbot_dca(
     potential_stages = []
     entry_timestamp = np.nan
     for level, (price, amount) in enumerate(zip(prices, amounts_quote)):
-        total_amount = sum(amounts_quote[: level + 1])
-        total_quote = sum(amounts_quote[i] * prices[i] for i in range(level + 1))
+        total_amount = sum(amounts_quote[: level + 1], Decimal(0))
+        total_quote = sum((amounts_quote[i] * prices[i] for i in range(level + 1)), Decimal(0))
         break_even_price = total_quote / total_amount
         entry_condition = df_filtered["close"] <= price if side == "BUY" else df_filtered["close"] >= price
         entry_timestamp = df_filtered.loc[entry_condition, "timestamp"].min()
         if pd.isna(entry_timestamp):
             break
 
-        returns_df = df_filtered[entry_timestamp:]
+        returns_df = df_filtered[slice(entry_timestamp, None)]
         returns = returns_df["close"].pct_change().fillna(0)
         cumulative_returns = ((1 + returns).cumprod() - 1) * side_multiplier - 2 * trade_cost
         take_profit_timestamp = np.nan

@@ -16,16 +16,19 @@ REQUIRED = ("ledger.pkl", "metadata.json")
 
 
 def _verify_download(root, expected_manifest):
-    # ponytail: fixed two-artifact demo; production must validate its own required set
-    # and run identity against the submitted request, not accept a self-declared set.
+    # Fixed two-artifact demo: the expected manifest is held by the caller,
+    # separately from the downloaded files. Production must additionally bind
+    # this expectation to its independently verified submit/run context.
     manifest = json.loads((root / "manifest.json").read_text())
-    assert manifest == expected_manifest
+    assert manifest["run_id"] == expected_manifest["run_id"]
     assert set(manifest["artifacts"]) == set(REQUIRED)
+    assert set(expected_manifest["artifacts"]) == set(REQUIRED)
     for name in REQUIRED:
         payload = (root / name).read_bytes()
         entry = manifest["artifacts"][name]
         assert len(payload) == entry["size_bytes"]
         assert hashlib.sha256(payload).hexdigest() == entry["sha256"]
+        assert entry == expected_manifest["artifacts"][name]
 
 
 @pytest.fixture

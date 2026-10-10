@@ -158,7 +158,8 @@ QLib repo實際 DCA callers只有public export及七個測試。
 真實backtest_hummingbot_dca、真實MLflow file store與MLflowRecorder，不mock保存成功。
 保存raw stage ledger、close type/config metadata與hash manifest，讀回比較DataFrame與metadata。
 另五個負測試：missing file、truncated bytes、wrong hash、manifest missing required entry、wrong run ID。
-這是固定兩artifact的最小範例；production要自己的metrics/fills/equity/identity schema。
+測試從下載檔案重新計算 size/hash，再與呼叫端獨立持有的預期 manifest 比較；run ID 也逐欄核對，避免僅因整份字典不相等就提前通過負測試。
+這是固定兩artifact的最小範例；production要由真實 submit/run context 驗證身份，並提供自己的metrics/fills/equity/identity schema。
 不把示例manifest的run_id或raw ledger冒充完整Pipeline result。
 
 ## 6. HTML v8.6 只讀核對及04/05精確補強文案

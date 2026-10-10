@@ -25,7 +25,7 @@
     "subtests_passed": 82,
     "seconds": 7.23,
     "command": "env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 .venv/bin/python -m pytest -q tests/security tests/backtest/test_hummingbot_dca.py tests/backtest/test_hummingbot_dca_artifacts.py tests/test_ci_configuration.py tests/test_tra_example.py",
-    "new_test_sha256": "354797329a1e4b3925e27532d9ffed0aaea725edad8cb4b2a0223d29e56f2643"
+    "new_test_sha256": "d800545516cda2233a7484e071b0161b1b6e2180d2ee83b75ee5aff3fdfbd63b"
   },
   "mypy": "qlib/rl/utils/log.py:349: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]\nqlib/rl/utils/log.py:350: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]\nSuccess: no issues found in 56 source files",
   "dependency_check": "Checked 234 packages in 3ms\nAll installed packages are compatible",

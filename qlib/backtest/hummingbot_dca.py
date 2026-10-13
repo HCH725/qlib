@@ -26,6 +26,11 @@ def simulate_hummingbot_dca(
     ``qlib.backtest`` as ``backtest_hummingbot_dca`` for callers that need this
     execution path; it deliberately does not alter the generic Qlib backtest or
     Exchange order path. BUY/MAKER remains the backward-compatible default.
+
+    The returned frame is an executor quote-allocation/PnL ledger, not a
+    base-quantity fill journal or an account-equity report. This callable does
+    not evaluate strategy signals or manage capital, isolated margin, funding
+    or slippage. Persisting its output alone is not full-strategy evidence.
     """
     side = getattr(side, "value", side)
     mode = getattr(mode, "value", mode)

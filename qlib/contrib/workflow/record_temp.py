@@ -113,6 +113,8 @@ class S01509DCARecord(RecordTemp):
         self.config_path = Path(config_path)
 
     def generate(self):
+        # Keep exact-int checks (bool must fail); import here to avoid changing dependency order.
+        # pylint: disable=import-outside-toplevel,unidiomatic-typecheck
         from ...backtest import backtest_hummingbot_dca
 
         config_bytes = self.config_path.read_bytes()

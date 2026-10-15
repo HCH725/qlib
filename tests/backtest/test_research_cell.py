@@ -85,7 +85,7 @@ def spec_for(cells_dir="/results/_validation/formal-cells-round0"):
             "approved": False,
             "note": "round0 research cost model is not approved yet; campaign claimability stays false",
         },
-        "materialize": {"cells_dir": cells_dir},
+        "materialize": {"cells_dir": cells_dir, "results_root": "/results/_validation"},
     }
 
 
@@ -209,6 +209,21 @@ def test_materialize_writes_42_bindable_cells():
         )
         good += int(same_source and bindable)
     check("every cell is byte-identical, hash-consistent and bindable", good == 42, good)
+    out_dirs = {entry["evidence_refs"]["manifest"].rsplit("/", 1)[0] for entry in manifest["cells"]}
+    check("every cell gets its own transport run location", len(out_dirs) == 42, len(out_dirs))
+    check("evidence refs are the transport run location the readback reports",
+          all(entry["evidence_refs"]["manifest"].endswith("/manifest.json")
+              and entry["evidence_refs"]["mlflow_readback"]
+              == entry["evidence_refs"]["manifest"].replace("manifest.json", "mlflow_readback.json")
+              and entry["evidence_refs"]["manifest"].startswith("/results/_validation/n8n-live-")
+              for entry in manifest["cells"]))
+    check("the run-location formula reproduces the deployed representative evidence dir",
+          cell.out_dir_short({
+              "source_blob_sha": "8a09f6e642261714ef72872b601b8f679e1f0d30",
+              "entrypoint_sha256": "000e23b739eb13a7c3b1077af5501556bd73fd2ec0e9d439ce1e6d5113d14c05",
+              "effective_config_sha256": "7a976cce5a6d418c635af073e9df7f553b6893259c79e59722f49b368c28d1d2",
+              "qlib_runtime_commit": "bee09f23d938b96c2c1ef82d891aa0abfa171cd0",
+          }) == "8b37e4ca2140")
     try:
         cell.materialize(spec_path, root)
         check("materialize refuses overwrite", False)

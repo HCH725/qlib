@@ -251,6 +251,16 @@ def build_effective_config(spec, identity):
     }
 
 
+def out_dir_short(frozen):
+    """Return the transport's out_dir suffix for one frozen cell identity.
+
+    Mirrors research-transport.py ``out_dir_for``: the JSON of the four frozen
+    fields, keys sorted, separators collapsed, sha256, first 12 hex chars.
+    """
+    canonical = json.dumps(frozen, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
 def materialize(spec_path, root, force=False):
     """Write the 42 frozen cell dirs and the campaign manifest. Return the manifest."""
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
@@ -274,6 +284,19 @@ def materialize(spec_path, root, force=False):
         (cell_dir / CONFIG_NAME).write_text(
             json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        entrypoint_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        config_sha256 = hashlib.sha256((cell_dir / CONFIG_NAME).read_bytes()).hexdigest()
+        out_dir = "%s/n8n-live-%s" % (
+            spec["materialize"]["results_root"],
+            out_dir_short(
+                {
+                    "effective_config_sha256": config_sha256,
+                    "entrypoint_sha256": entrypoint_sha256,
+                    "qlib_runtime_commit": spec["runtime"]["commit"],
+                    "source_blob_sha": spec["candidate"]["git_blob_sha"],
+                }
+            ),
+        )
         cells.append(
             {
                 "cell_id": identity["cell_id"],
@@ -284,16 +307,16 @@ def materialize(spec_path, root, force=False):
                 "candidate_path": spec["candidate"]["path"],
                 "source_blob_sha": spec["candidate"]["git_blob_sha"],
                 "entrypoint_ref": config["execution"]["entrypoint"],
-                "entrypoint_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                "entrypoint_sha256": entrypoint_sha256,
                 "effective_config_ref": config["execution"]["entrypoint"].rsplit("/", 1)[0] + "/" + CONFIG_NAME,
-                "effective_config_sha256": hashlib.sha256(
-                    (cell_dir / CONFIG_NAME).read_bytes()
-                ).hexdigest(),
+                "effective_config_sha256": config_sha256,
                 "qlib_runtime_commit": spec["runtime"]["commit"],
                 "capabilities": {"execution": ["qlib-native-backtest"], "data": ["btcusdt-1h"], "timing": ["bar-close-1h"]},
-                "evidence_refs": {"candidate": spec["candidate"]["blob_api_ref"],
-                                  "mlflow_readback": "cell-out-dir/mlflow_readback.json",
-                                  "manifest": "cell-out-dir/manifest.json"},
+                "evidence_refs": {
+                    "candidate": spec["candidate"]["blob_api_ref"],
+                    "manifest": out_dir + "/manifest.json",
+                    "mlflow_readback": out_dir + "/mlflow_readback.json",
+                },
                 "research_cost_model": dict(spec["research_cost_model"]),
                 "run_inputs": {"symbol": identity["symbol"], "timeframe": identity["timeframe"],
                                "research_leverage": identity["research_leverage"]},

@@ -169,6 +169,7 @@ def test_cell_config_fails_closed_without_approved_values():
     for label, mutate in (
         ("missing so_spacing", lambda cfg: cfg["house_overlay"].pop("so_spacing_pct")),
         ("missing take_profit declaration", lambda cfg: cfg["house_overlay"].pop("take_profit_pct")),
+        ("missing initial capital", lambda cfg: cfg["house_overlay"].pop("initial_capital_quote")),
         ("undeclared cost model approval", lambda cfg: cfg["research_cost_model"].pop("approved")),
         ("leverage outside the frozen set", lambda cfg: cfg.update(research_leverage=4)),
         ("symbol outside the frozen set", lambda cfg: cfg["strategy"].update(symbol="PEPEUSDT")),
@@ -238,6 +239,15 @@ def test_materialize_writes_42_bindable_cells():
     except SystemExit as exc:
         check("materialize holds without an approved overlay value",
               "no approved value" in str(exc), exc)
+    missing_capital = spec_for()
+    missing_capital["house_overlay"].pop("initial_capital_quote")
+    spec_path.write_text(json.dumps(missing_capital), encoding="utf-8")
+    held_before_write = False
+    try:
+        cell.materialize(spec_path, tmp / "cells3")
+    except SystemExit as exc:
+        held_before_write = "no approved value" in str(exc) and not (tmp / "cells3").exists()
+    check("materialize holds without an initial capital allocation before writing", held_before_write)
 
 
 def test_research_leverage_scales_stage_exposure():

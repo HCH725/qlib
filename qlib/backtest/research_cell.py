@@ -55,6 +55,7 @@ OVERLAY_KEYS = (
     "take_profit_pct",
     "stop_loss_pct",
     "trade_cost",
+    "initial_capital_quote",
 )
 #: Keys that must carry a usable number, not just be declared.
 OVERLAY_NUMERIC_KEYS = (
@@ -63,6 +64,7 @@ OVERLAY_NUMERIC_KEYS = (
     "safety_order_levels",
     "so_spacing_pct",
     "trade_cost",
+    "initial_capital_quote",
 )
 COST_MODEL_KEYS = ("fees_per_side", "slippage", "funding", "approved")
 

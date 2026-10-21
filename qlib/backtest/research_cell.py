@@ -60,23 +60,11 @@ from pathlib import Path
 
 SCHEMA = "qlib-formal-research-cell-v1"
 #: Frozen round0 coverage. Symbols/timeframes/leverages are the 42-cell set.
-#: Coverage only: this file validates the shape of a cell identity, never
-#: membership here. A symbol or timeframe outside the set is a provider
-#: coverage fact, not a reason to refuse research.
+#: Research domain is fixed here: a strategy artifact never widens it.
 CELL_SYMBOLS = ("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "LINKUSDT")
 CELL_TIMEFRAMES = ("1h", "4h", "1d")
 CELL_LEVERAGES = (3, 5)
-#: Mechanical bar-size map. Not a gate: a timeframe outside it fails closed as
-#: an unmapped frequency, which is a missing primitive, not a verdict.
-QLIB_FREQ = {
-    "1m": "1min",
-    "5m": "5min",
-    "15m": "15min",
-    "30m": "30min",
-    "1h": "60min",
-    "4h": "240min",
-    "1d": "day",
-}
+QLIB_FREQ = {"1h": "60min", "4h": "240min", "1d": "day"}
 ENTRYPOINT_NAME = "run_cell.entrypoint.py"
 CONFIG_NAME = "effective_config.json"
 #: The single run-scoped strategy artifact: one file, one function.
@@ -84,7 +72,6 @@ SIGNAL_ARTIFACT_NAME = "strategy_signal.py"
 SIGNAL_FUNCTION = "signal"
 SIGNAL_ROW_KEYS = ("datetime", "high", "low", "close", "entry_transition", "exit_transition")
 HEX64 = re.compile(r"^[a-f0-9]{64}$")
-SYMBOL_SHAPE = re.compile(r"^[A-Z0-9]{2,20}$")
 
 #: The verified primitives every frozen cell declares. One reusable name per
 #: capability, never a per-symbol/per-timeframe entry: the cell reads the same
@@ -166,11 +153,10 @@ def problems_in_config(cfg):
     if not isinstance(strategy, dict):
         bad.append("strategy block is missing")
     else:
-        symbol = strategy.get("symbol")
-        if not isinstance(symbol, str) or not SYMBOL_SHAPE.match(symbol):
-            bad.append("strategy symbol is not a usable instrument name")
-        if strategy.get("timeframe") not in QLIB_FREQ:
-            bad.append("strategy timeframe is not a mapped qlib frequency")
+        if strategy.get("symbol") not in CELL_SYMBOLS:
+            bad.append("strategy symbol is outside the frozen 42-cell set")
+        if strategy.get("timeframe") not in CELL_TIMEFRAMES:
+            bad.append("strategy timeframe is outside the frozen 42-cell set")
         if not strategy.get("window_start_utc") or not strategy.get("window_end_utc_inclusive"):
             bad.append("strategy window bounds are missing")
         params = strategy.get("params")
@@ -188,8 +174,8 @@ def problems_in_config(cfg):
             if not HEX64.match(str(artifact.get("sha256"))):
                 bad.append("strategy artifact sha256 is not a 64-hex digest")
     leverage = cfg.get("research_leverage")
-    if not isinstance(leverage, int) or isinstance(leverage, bool) or leverage <= 0:
-        bad.append("research_leverage must be a positive integer")
+    if leverage not in CELL_LEVERAGES:
+        bad.append("research_leverage is outside the frozen set")
     overlay = cfg.get("house_overlay")
     if not isinstance(overlay, dict):
         bad.append("house_overlay block is missing")
@@ -315,26 +301,6 @@ def problems_in_signal_rows(rows):
         if len(bad) > 8:
             break
     return bad
-
-
-def feature_volume(symbol, start_time, end_time, freq):
-    """Return the provider volume column, or None when the field is absent.
-
-    ponytail: one extra frozen-provider read on purpose, guarded because a
-    provider without a volume field must not break a price-only artifact. The
-    ceiling is that a silent absence only shows up when an artifact asks for
-    volume and fails closed on None.
-    """
-    from qlib.data import D
-
-    try:
-        frame = D.features([symbol], ["$volume"], start_time=str(start_time),
-                           end_time=str(end_time), freq=freq).sort_index()
-    except Exception:
-        return None
-    if frame.empty or "$volume" not in frame:
-        return None
-    return frame["$volume"].astype(float).to_numpy()
 
 
 def build_effective_config(spec, identity, artifact_sha256):
@@ -495,8 +461,13 @@ def run_cell(cell_dir, out_dir, simulator=None):
 
     qlib.init(provider_uri=cfg["data"]["provider_ref"], region="us",
               expression_cache=None, dataset_cache=None)
-    features = D.features([symbol], ["$high", "$low", "$close"],
-                          start_time=str(warmup_start), end_time=str(run_end), freq=freq).sort_index()
+    fields = ["$high", "$low", "$close"]
+    try:
+        features = D.features([symbol], fields + ["$volume"],
+                              start_time=str(warmup_start), end_time=str(run_end), freq=freq).sort_index()
+    except Exception:  # ponytail: a frozen provider without volume is price-only; volume artifacts fail closed
+        features = D.features([symbol], fields,
+                              start_time=str(warmup_start), end_time=str(run_end), freq=freq).sort_index()
     if features.empty:
         raise SystemExit("HOLD: frozen provider returned no rows")
     times = [ts.to_pydatetime() for ts in features.index.get_level_values("datetime")]
@@ -504,7 +475,7 @@ def run_cell(cell_dir, out_dir, simulator=None):
         high=features["$high"].astype(float).to_numpy(),
         low=features["$low"].astype(float).to_numpy(),
         close=features["$close"].astype(float).to_numpy(),
-        volume=feature_volume(symbol, warmup_start, run_end, freq),
+        volume=None if "$volume" not in features else features["$volume"].astype(float).to_numpy(),
         times=times,
         params=dict(strategy.get("params") or {}),
         window_start=window_start.to_pydatetime(),

@@ -359,8 +359,8 @@ def test_frozen_identities_are_exactly_42_unique_cells():
           [i["cell_id"] for i in cell.campaign_identities()] == ids)
     check("no 43rd cell and no leverage outside 3/5",
           {i["research_leverage"] for i in identities} == {3, 5} and len(ids) == 42)
-    check("every frozen timeframe maps to a qlib frequency",
-          set(cell.CELL_TIMEFRAMES) <= set(cell.QLIB_FREQ))
+    check("timeframe maps to a qlib frequency",
+          {i["timeframe"] for i in identities} == set(cell.QLIB_FREQ))
 
 
 def test_cell_config_fails_closed_without_approved_values():
@@ -378,11 +378,11 @@ def test_cell_config_fails_closed_without_approved_values():
         ("missing take_profit declaration", lambda cfg: cfg["house_overlay"].pop("take_profit_pct")),
         ("missing initial capital", lambda cfg: cfg["house_overlay"].pop("initial_capital_quote")),
         ("undeclared cost model approval", lambda cfg: cfg["research_cost_model"].pop("approved")),
-        ("zero leverage", lambda cfg: cfg.update(research_leverage=0)),
+        ("leverage outside the frozen set", lambda cfg: cfg.update(research_leverage=4)),
         ("string leverage", lambda cfg: cfg.update(research_leverage="3")),
+        ("symbol outside the frozen set", lambda cfg: cfg["strategy"].update(symbol="PEPEUSDT")),
         ("empty symbol", lambda cfg: cfg["strategy"].update(symbol="")),
-        ("lowercase symbol", lambda cfg: cfg["strategy"].update(symbol="btcusdt")),
-        ("unmapped timeframe", lambda cfg: cfg["strategy"].update(timeframe="7h")),
+        ("timeframe outside the frozen set", lambda cfg: cfg["strategy"].update(timeframe="7h")),
         ("missing strategy params object", lambda cfg: cfg["strategy"].update(params=["entry_len"])),
         ("negative warmup", lambda cfg: cfg["strategy"].update(warmup_days=-1)),
         ("missing artifact", lambda cfg: cfg["strategy"].pop("artifact")),

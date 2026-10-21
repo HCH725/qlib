@@ -85,6 +85,12 @@ CAPABILITIES = {
     "execution": ["qlib-native-backtest"],
     "data": ["binance-usdm-ohlcv"],
     "timing": ["bar-close"],
+    #: The shared execution shell opens one long leg through the house DCA
+    #: overlay. A short leg or an atomic reversal is a genuinely different
+    #: execution primitive, so it is not in this set until it is built. A
+    #: strategy that declares it must HOLD instead of being silently reduced
+    #: to the side the shell happens to support.
+    "sides": ["long"],
 }
 
 
@@ -173,6 +179,25 @@ def problems_in_config(cfg):
                 bad.append("strategy artifact ref is not a python path")
             if not HEX64.match(str(artifact.get("sha256"))):
                 bad.append("strategy artifact sha256 is not a 64-hex digest")
+        # A declared side the shell cannot execute is a genuine capability gap,
+        # not a smaller version of the same strategy. Fail closed here; the
+        # readiness gate reports it as ENGINEERING_HOLD.
+        sides = strategy.get("sides")
+        if not isinstance(sides, list) or not sides:
+            bad.append("strategy execution sides are not declared")
+        else:
+            outside = [side for side in sides if side not in CAPABILITIES["sides"]]
+            if outside:
+                bad.append("strategy requires an execution side outside the engine capability: " + ", ".join(map(str, outside)))
+    capabilities = cfg.get("capabilities")
+    if not isinstance(capabilities, dict) or not capabilities:
+        bad.append("capability declaration is missing")
+    else:
+        for bucket, values in capabilities.items():
+            values = values if isinstance(values, list) else [values]
+            for value in values:
+                if bucket not in CAPABILITIES or value not in CAPABILITIES[bucket]:
+                    bad.append("capability is outside the engine's frozen set: %s:%s" % (bucket, value))
     leverage = cfg.get("research_leverage")
     if leverage not in CELL_LEVERAGES:
         bad.append("research_leverage is outside the frozen set")
@@ -312,10 +337,17 @@ def build_effective_config(spec, identity, artifact_sha256):
     entry_dir = "%s/%s" % (spec["materialize"]["cells_dir"], identity["cell_id"])
     strategy = dict(spec["strategy"], symbol=identity["symbol"], timeframe=identity["timeframe"])
     strategy["params"] = dict(strategy.get("params") or {})
+    strategy["sides"] = list(strategy.get("sides") or [])
     strategy["artifact"] = {
         "ref": "%s/%s" % (entry_dir, SIGNAL_ARTIFACT_NAME),
         "sha256": artifact_sha256,
     }
+    # The frozen capability declaration is the engine's verified primitive set
+    # plus the sides this strategy actually declares. The readiness gate reads
+    # this block from the frozen config, so a two-sided strategy cannot be
+    # re-labelled as long-only by whoever materialized it.
+    capabilities = {key: list(values) for key, values in CAPABILITIES.items()}
+    capabilities["sides"] = list(strategy["sides"])
     return {
         "schema": SCHEMA,
         "scope": "frozen round0 Formal Baseline cell; not Survivor/HB Certified",
@@ -328,6 +360,7 @@ def build_effective_config(spec, identity, artifact_sha256):
         },
         "research_leverage": identity["research_leverage"],
         "strategy": strategy,
+        "capabilities": capabilities,
         "house_overlay": dict(spec["house_overlay"]),
         "research_cost_model": dict(spec["research_cost_model"]),
         "economics_boundary": {
@@ -366,6 +399,16 @@ def materialize(spec_path, root, force=False):
         raise SystemExit("HOLD: strategy artifact source is not readable: " + artifact_ref)
     artifact_bytes = artifact_source.read_bytes()
     artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    # The strategy must state which execution sides it implements. A frozen
+    # two-sided record reduced to a long-only artifact is a capability gap, so
+    # it is refused before any cell is written instead of being shipped as a
+    # smaller version of the same strategy.
+    sides = (spec.get("strategy") or {}).get("sides")
+    if not isinstance(sides, list) or not sides:
+        raise SystemExit("HOLD: strategy.sides is not declared")
+    outside = [side for side in sides if side not in CAPABILITIES["sides"]]
+    if outside:
+        raise SystemExit("HOLD: the engine has no execution primitive for side: " + ", ".join(map(str, outside)))
     source = Path(__file__).resolve()
     source_bytes = source.read_bytes()
     cells = []
@@ -409,7 +452,7 @@ def materialize(spec_path, root, force=False):
                 "effective_config_ref": config["execution"]["entrypoint"].rsplit("/", 1)[0] + "/" + CONFIG_NAME,
                 "effective_config_sha256": config_sha256,
                 "qlib_runtime_commit": spec["runtime"]["commit"],
-                "capabilities": {key: list(values) for key, values in CAPABILITIES.items()},
+                "capabilities": {key: list(values) for key, values in config["capabilities"].items()},
                 "evidence_refs": {
                     "candidate": spec["candidate"]["blob_api_ref"],
                     "manifest": out_dir + "/manifest.json",

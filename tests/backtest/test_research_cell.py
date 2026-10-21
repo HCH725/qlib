@@ -79,6 +79,7 @@ def spec_for(cells_dir="/results/_validation/formal-cells-round0", artifact_path
         "data": {"provider_ref": "/results/_validation/formal-cells-round0/provider"},
         "strategy": {
             "family": "S01509",
+            "sides": ["long"],
             "params": {"entry_len": 20, "exit_len": 10},
             "warmup_days": 20,
             "window_start_utc": "2025-04-19 16:00:00",
@@ -389,10 +390,50 @@ def test_cell_config_fails_closed_without_approved_values():
         ("artifact ref is not python", lambda cfg: cfg["strategy"]["artifact"].update(ref="/tmp/x.txt")),
         ("artifact hash is not a digest", lambda cfg: cfg["strategy"]["artifact"].update(sha256="abc")),
         ("missing provider", lambda cfg: cfg["data"].pop("provider_ref")),
+        ("missing execution sides", lambda cfg: cfg["strategy"].pop("sides")),
+        ("short side the shell cannot execute", lambda cfg: cfg["strategy"].update(sides=["long", "short"])),
+        ("missing capability declaration", lambda cfg: cfg.pop("capabilities")),
+        ("capability outside the frozen set", lambda cfg: cfg["capabilities"].update(execution=["qlib-native-backtest", "grid-runner"])),
+        ("capability sides diverging from the strategy", lambda cfg: cfg["capabilities"].update(sides=["long", "short"])),
     ):
         broken = cell_config()
         mutate(broken)
         check("fail closed: " + label, cell.problems_in_config(broken) != [])
+
+
+def test_a_two_sided_strategy_holds_before_any_cell_is_written():
+    """A frozen two-sided record must not be shipped as a long-only artifact.
+
+    The shell executes one long leg. Declaring the missing side is how the
+    engineering flow states the true capability gap, so materialize() refuses
+    before writing a single cell instead of producing a smaller strategy under
+    the same candidate identity.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-two-sided-"))
+    spec = spec_for()
+    spec["strategy"]["sides"] = ["long", "short"]
+    spec_path = tmp / "campaign-spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    root = tmp / "cells"
+    held = None
+    try:
+        cell.materialize(spec_path, root)
+    except SystemExit as exc:
+        held = str(exc)
+    check("a two-sided strategy holds with the missing execution primitive",
+          held is not None and "execution primitive for side: short" in held, held)
+    check("no cell is written for the unsupported strategy", not root.exists())
+    undeclared = spec_for()
+    undeclared["strategy"].pop("sides")
+    undeclared_path = tmp / "undeclared.json"
+    undeclared_path.write_text(json.dumps(undeclared), encoding="utf-8")
+    held = None
+    try:
+        cell.materialize(undeclared_path, tmp / "cells2")
+    except SystemExit as exc:
+        held = str(exc)
+    check("an artifact that does not declare its sides is refused",
+          held is not None and "sides is not declared" in held, held)
 
 
 def test_materialize_writes_42_bindable_cells():
@@ -508,8 +549,10 @@ def test_capability_declaration_is_one_reusable_primitive_set():
               + list(cell.CELL_TIMEFRAMES)
               + ["btcusdt-1h", "bar-close-1h"]
           ), json.dumps(declarations[0], sort_keys=True))
-    check("the declaration buckets are exactly execution/data/timing",
-          set(cell.CAPABILITIES) == {"execution", "data", "timing"}, sorted(cell.CAPABILITIES))
+    check("the declaration buckets are exactly execution/data/timing/sides",
+          set(cell.CAPABILITIES) == {"execution", "data", "timing", "sides"}, sorted(cell.CAPABILITIES))
+    check("the shell declares only the long side it actually executes",
+          cell.CAPABILITIES["sides"] == ["long"], cell.CAPABILITIES["sides"])
     mutated = cell_config(index=41)
     mutated["strategy"]["symbol"] = "DOGEUSDT"
     mutated["strategy"]["timeframe"] = "1d"

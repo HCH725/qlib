@@ -250,6 +250,39 @@ def test_materialize_writes_42_bindable_cells():
     check("materialize holds without an initial capital allocation before writing", held_before_write)
 
 
+def test_capability_declaration_is_one_reusable_primitive_set():
+    """Every cell declares the same reusable primitives, never its own identity.
+
+    A per-cell name (``dogeusdt-1d``) would turn the capability gate into a
+    42-entry allowlist that cannot fail, and would let one hardcoded symbol
+    stand in for the other 41. Coverage is measured provider readiness instead.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-caps-"))
+    spec_path = tmp / "campaign-spec.json"
+    spec_path.write_text(json.dumps(spec_for()), encoding="utf-8")
+    manifest = cell.materialize(spec_path, tmp / "cells")
+    declarations = [entry["capabilities"] for entry in manifest["cells"]]
+    check("every cell declares the reusable primitive set",
+          all(decl == cell.CAPABILITIES for decl in declarations),
+          sorted({json.dumps(d, sort_keys=True) for d in declarations}))
+    check("the declaration is identical across all 42 cells",
+          len({json.dumps(d, sort_keys=True) for d in declarations}) == 1)
+    check("the declaration names no symbol, timeframe or per-cell identity",
+          not any(
+              token in json.dumps(declarations).lower()
+              for token in [symbol.lower() for symbol in cell.CELL_SYMBOLS]
+              + list(cell.CELL_TIMEFRAMES)
+              + ["btcusdt-1h", "bar-close-1h"]
+          ), json.dumps(declarations[0], sort_keys=True))
+    check("the declaration buckets are exactly execution/data/timing",
+          set(cell.CAPABILITIES) == {"execution", "data", "timing"}, sorted(cell.CAPABILITIES))
+    mutated = cell.build_effective_config(spec_for(), cell.campaign_identities()[41])
+    mutated["strategy"]["symbol"] = "DOGEUSDT"
+    mutated["strategy"]["timeframe"] = "1d"
+    check("a non-BTC/1h cell config still validates on the same primitives",
+          cell.problems_in_config(mutated) == [], cell.problems_in_config(mutated))
+
+
 def test_research_leverage_scales_stage_exposure():
     base = spec_for()["house_overlay"]
     amounts_3 = cell.house_dca_amounts(base["base_order_quote_pct"], base["safety_order_quote_pct"],

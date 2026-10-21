@@ -45,6 +45,21 @@ QLIB_FREQ = {"1h": "60min", "4h": "240min", "1d": "day"}
 ENTRYPOINT_NAME = "run_cell.entrypoint.py"
 CONFIG_NAME = "effective_config.json"
 
+#: The verified primitives every frozen cell declares. One reusable name per
+#: capability, never a per-symbol/per-timeframe entry: the cell reads the same
+#: Binance USD-M OHLCV provider through the same Qlib bar-close decision path
+#: for any covered symbol and timeframe. Symbol/timeframe coverage is a
+#: measured provider-readiness fact, not a capability. A cell that needs a
+#: genuinely different execution/data/timing primitive must add it here only
+#: after one representative validation, which is an engineering gate, not a
+#: second strategy admission.
+CAPABILITIES = {
+    "execution": ["qlib-native-backtest"],
+    "data": ["binance-usdm-ohlcv"],
+    "timing": ["bar-close"],
+}
+
+
 #: Required house-overlay keys. No default: an unapproved value must hold.
 #: take_profit_pct/stop_loss_pct may be an explicit null (disabled), never absent.
 OVERLAY_KEYS = (
@@ -313,7 +328,7 @@ def materialize(spec_path, root, force=False):
                 "effective_config_ref": config["execution"]["entrypoint"].rsplit("/", 1)[0] + "/" + CONFIG_NAME,
                 "effective_config_sha256": config_sha256,
                 "qlib_runtime_commit": spec["runtime"]["commit"],
-                "capabilities": {"execution": ["qlib-native-backtest"], "data": ["btcusdt-1h"], "timing": ["bar-close-1h"]},
+                "capabilities": {key: list(values) for key, values in CAPABILITIES.items()},
                 "evidence_refs": {
                     "candidate": spec["candidate"]["blob_api_ref"],
                     "manifest": out_dir + "/manifest.json",

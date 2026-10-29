@@ -16,9 +16,11 @@ Boundary, deliberately narrow:
   artifact: one Python file with one callable ``signal()``, loaded from the
   cell directory and bound to the sha256 declared in the cell config.
 - ``research_leverage`` multiplies the house quote allocation only (base quote
-  allocation x research_leverage). It is a research exposure multiplier. It is
-  not a Binance liquidation, isolated-margin, funding or account-equity model;
-  canonical economics stay with the Node13 Hummingbot certification lane.
+  allocation x research_leverage). It is a research exposure multiplier: it is
+  not a Binance liquidation or isolated-margin account model, and it is not an
+  account-equity model. Funding is a separate charge this run applies from a
+  verified source identity (see Funding, below); canonical execution economics
+  and certification stay with the Node13 Hummingbot certification lane.
 - DCA stage semantics reuse the exported Qlib <-> Hummingbot DCA path
   (``qlib.backtest.backtest_hummingbot_dca``) over the frozen provider.
 - Every overlay parameter comes from the cell config. This file invents none:
@@ -52,13 +54,25 @@ Full-strategy replay, one long cycle at a time::
 
 Evidence written per cell::
 
-    summary.json   cycle plan and per-cycle stage facts
+    summary.json   cycle plan, per-cycle stage facts, applied funding economics
     signals.csv    the artifact's rows inside the frozen evaluation window
-    trades.csv     one row per replayed cycle: entry/exit/close, stages, PnL
+    trades.csv     one row per replayed cycle: entry/exit/close, stages, fees, funding, net PnL
     events.csv     one row per replayed stage (the pinned transport reads it)
+    funding_events.csv  one row per charged funding event (empty header when nothing was held)
     equity.csv     the whole evaluation window, flat bars included
-    metrics.json   fee-inclusive performance metrics plus their definitions
+    metrics.json   fee-and-funding-inclusive performance metrics plus their definitions
     manifest.json  sha256 of every non-MLflow evidence file in this directory
+
+Funding, deliberately narrow::
+
+    A long perpetual position pays funding, so a fee-only replay cannot honestly
+    claim net performance. ``research_cost_model.funding`` is either the explicit
+    ``not_modeled`` declaration or one structured source identity
+    (``binance-usdm-funding-v1``). An identity is verified against the exact bytes
+    on disk before it can reach PnL or claimability, and a modeled
+    (``modeled_funding``) row reconstructs its mark from the 1h mark bar OPEN of
+    the UTC hour containing the event. Every funding comparison happens at a bar
+    CLOSE boundary derived from the timeframe, never at a Qlib bar label.
 
 Verbs::
 
@@ -74,11 +88,12 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -141,6 +156,29 @@ OVERLAY_NUMERIC_KEYS = (
 )
 COST_MODEL_KEYS = ("fees_per_side", "slippage", "funding", "approved")
 
+#: Binance USD-M funding: the one frozen source identity a run may apply. A
+#: declaration is a proven-source claim, so it carries the exact bytes it used.
+FUNDING_BASIS = "binance-usdm-funding-v1"
+FUNDING_MODELED_MARK_BASIS = "binance-usdm-mark-1h-open-v1"
+#: The only ``truth_status`` values the replay may read. Anything else is a HOLD:
+#: an unregistered estimate must never be mistaken for a modeled or official row.
+FUNDING_TRUTH_STATUS = ("official", "modeled_funding")
+FUNDING_IDENTITY_KEYS = (
+    "basis",
+    "source_ref",
+    "source_sha256",
+    "truth_status",
+    "modeled_mark_basis",
+    "modeled_mark_snapshot_sha256",
+)
+#: The explicit "this cell does not model funding" declaration. It keeps a cell
+#: runnable, and it keeps ``performance_claimable`` false: nothing is zero-filled.
+FUNDING_NOT_MODELED = (None, "not_modeled")
+#: Milliseconds per frozen timeframe. A Qlib row label is the bar OPEN, so the
+#: close boundary is label + this interval; funding ordering is defined at close.
+TIMEFRAME_MS = {"1h": 3_600_000, "4h": 4 * 3_600_000, "1d": 86_400_000}
+FUNDING_HOUR_MS = 3_600_000
+
 
 def cell_id(symbol, timeframe, research_leverage):
     """Return the stable identity string for one cell."""
@@ -160,6 +198,31 @@ def campaign_identities():
         for timeframe in CELL_TIMEFRAMES
         for leverage in CELL_LEVERAGES
     ]
+
+
+def problems_in_funding_identity(identity):
+    """Return the fail-closed problems in one declared funding source identity.
+
+    The identity is the only thing that can prove which bytes a net-of-funding
+    number came from, so every field is checked by name and by literal value
+    before the series is read. A partial identity is a declaration, not a proof.
+    """
+    if not isinstance(identity, dict):
+        return ["funding is not a structured source identity"]
+    bad = ["funding identity is missing %s" % key for key in FUNDING_IDENTITY_KEYS if key not in identity]
+    if identity.get("basis") != FUNDING_BASIS:
+        bad.append("funding identity basis is not %s" % FUNDING_BASIS)
+    if identity.get("modeled_mark_basis") != FUNDING_MODELED_MARK_BASIS:
+        bad.append("funding identity modeled_mark_basis is not %s" % FUNDING_MODELED_MARK_BASIS)
+    if list(identity.get("truth_status") or []) != list(FUNDING_TRUTH_STATUS):
+        bad.append("funding identity truth_status is not exactly %s" % (list(FUNDING_TRUTH_STATUS),))
+    source_ref = identity.get("source_ref")
+    if not isinstance(source_ref, str) or not Path(source_ref).is_absolute():
+        bad.append("funding identity source_ref is not an absolute path")
+    for key in ("source_sha256", "modeled_mark_snapshot_sha256"):
+        if not HEX64.match(str(identity.get(key))):
+            bad.append("funding identity %s is not a 64-hex digest" % key)
+    return bad
 
 
 def problems_in_config(cfg):
@@ -242,6 +305,13 @@ def problems_in_config(cfg):
         for key in COST_MODEL_KEYS:
             if key not in cost:
                 bad.append("research cost model does not declare %s" % key)
+        if "funding" in cost:
+            funding = cost["funding"]
+            if isinstance(funding, dict):
+                bad.extend(problems_in_funding_identity(funding))
+            elif funding not in FUNDING_NOT_MODELED:
+                bad.append("research cost model funding is neither a proven source identity nor the "
+                           "explicit not_modeled declaration")
     return bad
 
 
@@ -301,30 +371,29 @@ SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 #: The DCA close types that are the overlay's own exit. Any other close type is
 #: the frozen frame boundary: the strategy exit, or the forced flat at window end.
 OVERLAY_CLOSE_TYPES = ("TAKE_PROFIT", "STOP_LOSS", "TRAILING_STOP")
-#: Funding is applied nowhere in the replay: the existing DCA primitive models no
-#: funding rate and no funding payment. Net-performance evidence needs funding in
-#: PnL, so this stays False and keeps the performance claim false regardless of what
-#: a cost model declares.
-FUNDING_APPLIED_TO_PNL = False
 #: Every definition is persisted with the metrics, so no reader has to guess.
 REPLAY_DEFINITIONS = {
     "cycle": "one long cycle: an entry_transition bar through the next exit_transition bar. The house DCA overlay runs on that frame only, so its own exit is a close boundary and the source state decides when the next cycle may start.",
     "close_reason_precedence": "TP > SL > trailing > strategy exit on the same bar: the existing DCA primitive reports TAKE_PROFIT before STOP_LOSS before TRAILING_STOP. Otherwise the close bar is the frame boundary = STRATEGY_EXIT, or FORCE_FLAT for a cycle still open on the last evaluation bar.",
     "stop_loss_scope": "unchanged existing primitive semantics: stop_loss is evaluated on the last DCA stage only, i.e. after the safety orders filled.",
     "time_limit": "no overlay time limit is declared, so the primitive's TIME_LIMIT close is the frozen frame boundary itself, not an invented house parameter.",
-    "fee_model": "unchanged existing primitive semantics: 2 * house_overlay.trade_cost of each filled stage's quote amount is subtracted from that stage's return, from the stage's entry bar onward. Fees are therefore a round-trip estimate charged for the whole open path, not per-fill exchange event timing, and no slippage or funding is applied.",
+    "bar_boundary": "a Qlib row label is the bar OPEN. Every funding comparison uses the bar CLOSE boundary = label + the frozen timeframe interval (1h/4h/1d), so an event at a bar's open never charges a stage first filled on that bar.",
+    "fee_model": "unchanged existing primitive semantics: 2 * house_overlay.trade_cost of each filled stage's quote amount is subtracted from that stage's return, from the stage's entry bar onward. Fees are therefore a round-trip estimate charged for the whole open path, not per-fill exchange event timing, and no slippage is applied. Funding is a separate charge: see funding_model.",
+    "funding_model": "Binance USD-M perpetual funding, long only. A positive funding_rate is paid (it reduces PnL) and a negative one is received. The payment at one event is held_base_qty * funding_mark_price * funding_rate, where held_base_qty is the sum of the DCA stages whose stage_quote/stage_price is held immediately before the event. Every comparison uses the event's normalized UTC-hour boundary (funding_time_ms floored to its UTC hour, which is also the 1h mark bar open), never the raw jittered funding_time_ms; the raw value stays in the evidence as source data. A stage filled at bar close T is NOT charged for an event whose boundary is T (eligibility: fill_close_ms < funding_boundary_ms), because it was not held during the interval the event pays for; a position closing at bar close T IS charged for an event whose boundary is T (eligibility: funding_boundary_ms <= close_boundary_ms), because it was held through that interval. Official rows use the official mark_price; modeled_funding rows use the registered rate and reconstruct the mark from the OPEN of the Binance USD-M 1h mark bar at the event boundary, and are never described as official. No event is charged while the source is source_long and the account flat, and no event after a cycle's close boundary is charged to that cycle. Funding is charged into the same bar's equity as the rest of that bar's PnL.",
     "position_state": "flat = no source cycle and no account exposure; long = source cycle open and the DCA overlay holds quote exposure; source_long = source cycle open, the overlay already closed its own exit, account flat.",
-    "equity": "initial_capital_quote + realized net PnL of finished cycles + the open cycle's own DCA ledger net_pnl_quote. filled_amount_quote is a quote allocation (doubled on its final bar by the primitive) and is never treated as account equity.",
-    "net_return_pct": "100 * (end_equity / start_equity - 1), fee-inclusive account equity.",
-    "cagr_pct": "100 * ((end_equity / start_equity) ** (365*24*3600 / elapsed_seconds) - 1): true geometric CAGR over the actual elapsed evaluation time. Null when either end is not positive or elapsed time is not positive.",
-    "sharpe": "sqrt(periods_per_year) * mean(bar_return) / stdev(bar_return, ddof=1), zero risk-free, every evaluation-window bar including flat bars. Null when fewer than 2 bars or the stdev is zero.",
-    "max_drawdown_pct": "100 * max over bars of (running peak equity - equity) / running peak equity; the running peak is initialized from frozen initial capital before the first evaluation bar, so first-bar costs are included; 0.0 when equity never falls.",
-    "bar_return": "equity[t] / equity[t-1] - 1 for t>0; on the first evaluation bar, equity[0] / frozen_initial_capital - 1 so first-bar fees/PnL are not dropped. A non-positive prior/base equity is a HOLD.",
-    "win_rate_pct": "100 * cycles with positive realized net PnL / total cycles. Null when there is no cycle.",
+    "equity": "initial_capital_quote + realized net PnL of finished cycles + the open cycle's own DCA ledger net_pnl_quote - the funding charged so far by the open cycle. filled_amount_quote is a quote allocation (doubled on its final bar by the primitive) and is never treated as account equity.",
+    "net_return_pct": "100 * (end_equity / start_equity - 1): account equity net of fees and funding.",
+    "cagr_pct": "100 * ((end_equity / start_equity) ** (365*24*3600 / elapsed_seconds) - 1): true geometric CAGR over the actual elapsed evaluation time on fee-and-funding-inclusive equity. Null when either end is not positive or elapsed time is not positive.",
+    "sharpe": "sqrt(periods_per_year) * mean(bar_return) / stdev(bar_return, ddof=1), zero risk-free, every evaluation-window bar including flat bars, computed on fee-and-funding-inclusive returns. Null when fewer than 2 bars or the stdev is zero.",
+    "max_drawdown_pct": "100 * max over bars of (running peak equity - equity) / running peak equity, on fee-and-funding-inclusive equity; the running peak is initialized from frozen initial capital before the first evaluation bar, so first-bar costs are included; 0.0 when equity never falls.",
+    "bar_return": "equity[t] / equity[t-1] - 1 for t>0; on the first evaluation bar, equity[0] / frozen_initial_capital - 1 so first-bar fees, funding and PnL are not dropped. A non-positive prior/base equity is a HOLD.",
+    "win_rate_pct": "100 * cycles with positive realized net PnL (after fees and funding) / total cycles. Null when there is no cycle.",
     "total_trades": "completed or forced long cycles replayed inside the evaluation window.",
-    "profit_factor": "gross positive realized cycle net PnL / abs(gross negative realized cycle net PnL). Null when there is no cycle, or when no cycle lost money (undefined/infinite).",
-    "net_profit_usdt": "sum of realized cycle net PnL; equals end_equity - frozen initial capital after the evaluation window is forced flat.",
-    "performance_claimable": "true only when the applied economics are proven equivalent to an approved research cost model AND every required promotion metric is defined (CAGR, Sharpe) AND at least one cycle was replayed. Approval alone is not enough, and funding is not applied to PnL at all, so no cell can claim net performance in this version: the flag stays false until funding actually reaches PnL.",
+    "profit_factor": "gross positive realized cycle net PnL after fees and funding / abs(gross negative realized cycle net PnL after fees and funding). Null when there is no cycle, or when no cycle lost money (undefined/infinite).",
+    "net_profit_usdt": "sum of realized cycle net PnL after fees and funding; equals end_equity - frozen initial capital after the evaluation window is forced flat.",
+    "trades_csv": "one row per replayed cycle. dca_net_pnl_quote is the house DCA primitive's own fee-inclusive result, funding_paid_quote is every funding event charged to that cycle, and realized_pnl_quote = dca_net_pnl_quote - funding_paid_quote.",
+    "funding_events_csv": "one row per charged funding event, in charge order: the cycle it hit, the registered funding_time, the UTC-hour boundary used, the rate, the mark price and where that mark came from, held_base_qty at that instant, and payment_quote (positive = paid out of PnL). A run that held nothing during the window writes the header only.",
+    "performance_claimable": "true only when the applied economics are proven equivalent to an approved research cost model - every declared cost is an explicit finite JSON number (null, empty, boolean, NaN/Infinity and string costs are refused, never read as zero), the declared fee equals the overlay's trade_cost, the declared slippage is exactly 0.0, funding is applied from a source identity that the runtime itself re-verified including both sha256 digests, and funding reconciles with cycle PnL and account equity - AND every required promotion metric is defined (CAGR, Sharpe) AND at least one cycle was replayed. Approval alone is not enough, and an unverified or absent funding source is never treated as zero. A declared not_modeled funding block therefore keeps this false.",
 }
 
 
@@ -358,22 +427,275 @@ def max_drawdown_pct(equity, initial_capital):
     return worst
 
 
-def applied_cost_matches_model(cfg):
+def utc_ms(moment):
+    """Return epoch milliseconds of one naive-UTC datetime, immune to the host timezone.
+
+    Every timestamp in this engine is naive UTC: the frozen provider rows, the
+    window bounds and the Binance funding series. ``datetime.timestamp()`` on a
+    naive value reads it as local time, which on a UTC+8 host would shift every
+    funding comparison by 8h, so the offset is stated explicitly instead.
+    """
+    return int(round(moment.replace(tzinfo=timezone.utc).timestamp() * 1000))
+
+
+def bar_close_ms(rows, index, timeframe):
+    """Return the CLOSE boundary in ms of one artifact row.
+
+    A Qlib row label is the bar OPEN. The funding ordering is defined at the bar
+    CLOSE, so every eligibility comparison in this module goes through this
+    boundary and never through ``rows[index]["datetime"]`` directly. Deriving it
+    from the timeframe is also what makes a 4h or 1d bar correct: an event inside
+    a bar is charged on that bar's close, not on its label.
+    """
+    if timeframe not in TIMEFRAME_MS:
+        raise SystemExit("HOLD: timeframe %r has no frozen bar interval" % (timeframe,))
+    return utc_ms(rows[index]["datetime"]) + TIMEFRAME_MS[timeframe]
+
+
+def funding_iso(moment_ms):
+    """Return one epoch-millisecond instant as an ISO-8601 UTC string."""
+    return datetime.fromtimestamp(moment_ms / 1000.0, tz=timezone.utc).isoformat()
+
+
+def funding_boundary_ms(funding_time_ms):
+    """Return the UTC-hour boundary one funding event belongs to.
+
+    Registered ``modeled_funding`` rows carry sub-second jitter (+6 ms observed)
+    and official rows are exact. Both name a UTC hour open, which is also the
+    ``open_time_ms`` of the 1h mark bar the modeled reconstruction must read, so
+    the jitter is floored here once instead of being compared raw.
+    """
+    if not isinstance(funding_time_ms, int) or isinstance(funding_time_ms, bool):
+        raise SystemExit("HOLD: funding row has no integer funding_time_ms")
+    return funding_time_ms - funding_time_ms % FUNDING_HOUR_MS
+
+
+def funding_mark_root(source_ref, symbol):
+    """Return the 1h mark root that belongs to one funding source path.
+
+    The registered layout puts the two series side by side::
+
+        <usdm>/funding/<SYMBOL>/<SYMBOL>-funding.jsonl.gz
+        <usdm>/mark/<SYMBOL>/1h/<SYMBOL>-1h-YYYY-MM.jsonl.gz
+
+    so the mark root is derived from the source path the identity already pins
+    rather than from a second config knob that could disagree with it.
+    """
+    return Path(source_ref).parents[2] / "mark" / symbol / "1h"
+
+
+def read_jsonl_gz(path, what):
+    """Return the objects of one gzipped JSONL file. Fail closed on any bad line."""
+    import gzip
+
+    path = Path(path)
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise SystemExit("HOLD: %s is not readable: %s (%s)" % (what, path, exc))
+    rows = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError as exc:
+            raise SystemExit("HOLD: %s line %d is not JSON: %s (%s)" % (what, number, path, exc))
+    if not rows:
+        raise SystemExit("HOLD: %s holds no rows: %s" % (what, path))
+    return rows
+
+
+def finite_float(value, what):
+    """Return one finite float, or fail closed naming the exact field.
+
+    A JSON boolean is a malformed financial value, never 0.0/1.0: ``float``
+    silently converts it, so it is refused *before* any conversion. A decimal
+    string stays accepted and unambiguous, because the registered source format
+    carries rates as strings and a string is not a falsy cost assumption.
+    """
+    if isinstance(value, bool):
+        raise SystemExit("HOLD: funding %s is a JSON boolean, not a number: %r" % (what, value))
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit("HOLD: funding %s is not numeric: %r" % (what, value))
+    if not math.isfinite(number):
+        raise SystemExit("HOLD: funding %s is not finite: %r" % (what, value))
+    return number
+
+
+def positive_float(value, what):
+    """Return one finite positive float, or fail closed naming the exact field."""
+    number = finite_float(value, what)
+    if number <= 0.0:
+        raise SystemExit("HOLD: funding %s is not positive: %r" % (what, value))
+    return number
+
+
+def modeled_mark_snapshot(files):
+    """Return the deterministic digest of the exact monthly mark files used.
+
+    ``files`` maps a POSIX path relative to ``<usdm>/mark`` to that file's
+    sha256. The digest is the sha256 of the sorted ``"<relpath>:<sha256>"`` lines
+    joined by newlines, so it depends on exactly which months were read and on
+    their bytes, and on nothing about where they were mounted.
+    """
+    lines = ["%s:%s" % (name, files[name]) for name in sorted(files)]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def load_funding_series(identity, symbol, window_start_ms, window_end_ms):
+    """Return the verified Binance USD-M funding series inside the evaluation window.
+
+    ``window_start_ms``/``window_end_ms`` are the first and last evaluation bar
+    CLOSE boundaries, so the window is exactly the set of boundaries a replay
+    could charge. Fail closed, never zero-fill: a wrong source sha256, a wrong
+    modeled-mark snapshot, a duplicate timestamp, an unregistered ``truth_status``,
+    a non-finite rate or price, and a modeled row whose 1h mark bar is absent are
+    all HOLDs.
+
+    The full in-window series is returned, modeled segment included; nothing is
+    dropped because it is not official, and a gap is never read as zero funding.
+    """
+    problems = problems_in_funding_identity(identity)
+    if problems:
+        raise SystemExit("HOLD: funding identity is not usable: " + "; ".join(problems))
+    source = Path(identity["source_ref"])
+    if not source.is_file():
+        raise SystemExit("HOLD: funding source is not readable: " + str(source))
+    actual = hashlib.sha256(source.read_bytes()).hexdigest()
+    if actual != identity["source_sha256"]:
+        raise SystemExit("HOLD: funding source sha256 mismatch: %s != %s" % (actual, identity["source_sha256"]))
+    seen_stamps, seen_boundaries, staged = set(), set(), []
+    for row in read_jsonl_gz(source, "funding source"):
+        if not isinstance(row, dict):
+            raise SystemExit("HOLD: funding source row is not an object")
+        if row.get("symbol") != symbol:
+            raise SystemExit(
+                "HOLD: funding source symbol %r does not match the cell symbol %r" % (row.get("symbol"), symbol))
+        stamp = row.get("funding_time_ms")
+        boundary = funding_boundary_ms(stamp)
+        if stamp in seen_stamps:
+            raise SystemExit("HOLD: duplicate funding timestamp in the source: %d" % stamp)
+        if boundary in seen_boundaries:
+            raise SystemExit("HOLD: two funding events share the UTC hour boundary %d" % boundary)
+        seen_stamps.add(stamp)
+        seen_boundaries.add(boundary)
+        status = row.get("truth_status")
+        if status not in FUNDING_TRUTH_STATUS:
+            raise SystemExit("HOLD: funding row %d has truth_status %r, outside the frozen %s"
+                             % (stamp, status, list(FUNDING_TRUTH_STATUS)))
+        rate = finite_float(row.get("funding_rate"), "funding_rate at %d" % stamp)
+        if not (window_start_ms <= boundary <= window_end_ms):
+            continue
+        staged.append({
+            "funding_time_ms": stamp,
+            "boundary_ms": boundary,
+            "funding_rate": rate,
+            "truth_status": status,
+            "mark_price": row.get("mark_price"),
+            "mark_price_source": row.get("funding_price_source"),
+        })
+    mark_root = funding_mark_root(source, symbol)
+    month_opens, required, events = {}, {}, []
+    for event in staged:
+        if event["truth_status"] == "official":
+            mark = positive_float(event["mark_price"], "official mark_price at %d" % event["funding_time_ms"])
+            source_note = event["mark_price_source"] or "binance_funding_history_mark_price"
+        else:
+            month = datetime.fromtimestamp(event["boundary_ms"] / 1000.0, tz=timezone.utc)
+            name = "%s-1h-%04d-%02d.jsonl.gz" % (symbol, month.year, month.month)
+            path = mark_root / name
+            if name not in month_opens:
+                if not path.is_file():
+                    raise SystemExit("HOLD: modeled funding has no 1h mark source: " + str(path))
+                opens = {}
+                for bar in read_jsonl_gz(path, "1h mark source"):
+                    try:
+                        stamp_ms, open_price = int(bar["open_time_ms"]), bar["open"]
+                    except (KeyError, TypeError, ValueError):
+                        raise SystemExit("HOLD: 1h mark row is malformed in " + str(path))
+                    if stamp_ms in opens:
+                        raise SystemExit("HOLD: duplicate 1h mark open_time %d in %s" % (stamp_ms, path))
+                    opens[stamp_ms] = open_price
+                month_opens[name] = opens
+                required[str(path.relative_to(mark_root.parents[1]))] = hashlib.sha256(path.read_bytes()).hexdigest()
+            if event["boundary_ms"] not in month_opens[name]:
+                raise SystemExit("HOLD: modeled funding has no 1h mark bar at %d (%s)"
+                                 % (event["boundary_ms"], path))
+            mark = positive_float(month_opens[name][event["boundary_ms"]],
+                                  "modeled mark open at %d" % event["funding_time_ms"])
+            source_note = FUNDING_MODELED_MARK_BASIS
+        events.append(dict(event, mark_price=mark, mark_price_source=source_note))
+    digest = modeled_mark_snapshot(required)
+    if digest != identity["modeled_mark_snapshot_sha256"]:
+        raise SystemExit("HOLD: modeled mark snapshot sha256 mismatch: %s != %s"
+                         % (digest, identity["modeled_mark_snapshot_sha256"]))
+    events.sort(key=lambda item: item["boundary_ms"])
+    counts = {}
+    for event in events:
+        counts[event["truth_status"]] = counts.get(event["truth_status"], 0) + 1
+    return {
+        "identity": {
+            "basis": FUNDING_BASIS,
+            "source_ref": str(source),
+            "source_sha256": actual,
+            "truth_status": list(FUNDING_TRUTH_STATUS),
+            "modeled_mark_basis": FUNDING_MODELED_MARK_BASIS,
+            "modeled_mark_snapshot_sha256": digest,
+        },
+        "events": events,
+        "truth_status_counts": counts,
+        "mark_snapshot": dict(sorted(required.items())),
+    }
+
+
+def declared_cost_number(block, key, where):
+    """Return (number, None) for one declared cost, or (None, reason).
+
+    The value must be an explicit finite JSON number. ``None``, an empty or
+    non-numeric string, a JSON boolean, NaN/Infinity and a numeric string are all
+    declarations that carry no number, and this replay never invents 0.0 to fill
+    one: a falsy value is not a cost assumption, it is a missing measurement.
+    """
+    if not isinstance(block, dict) or key not in block:
+        return None, "%s does not declare %s" % (where, key)
+    value = block[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, "%s.%s is not an explicit finite JSON number: %r" % (where, key, value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None, "%s.%s is not a finite JSON number: %r" % (where, key, value)
+    if not math.isfinite(number):
+        return None, "%s.%s is not finite: %r" % (where, key, value)
+    return number, None
+
+
+def applied_cost_matches_model(cfg, applied=None):
     """Return (matches, reason) for the applied economics against the declared model.
 
-    The replay applies exactly one cost, the existing DCA primitive's frozen
-    semantics: ``2 * house_overlay.trade_cost`` of each filled stage's quote
-    amount. Slippage is applied nowhere and funding is applied nowhere.
+    Two costs are applied: the existing DCA primitive's frozen semantics
+    (``2 * house_overlay.trade_cost`` of each filled stage's quote amount, no
+    slippage anywhere), and the funding series a verified source identity names.
 
-    Funding is the hard stop: a run whose PnL carries no funding cannot support
-    net-performance evidence, so declaring funding as zero or "not_modeled" is not
-    accepted as a match. That is a deliberate fail-closed gap, lifted only by
-    actually applying funding to PnL or by a separately audited policy that says
-    otherwise.
+    Every clause is a proof obligation, and none of them is satisfied by a
+    declaration alone:
 
-    ponytail: while FUNDING_APPLIED_TO_PNL is False this returns False for every
-    config, which is why the checks below are the ones a funding implementation must
-    still satisfy. Do not weaken them to make a claim true.
+    - the funding model must be a structured identity, not a zero or a label;
+    - the run must report the funding as applied AND reconciled;
+    - the identity the run actually resolved must equal the declared one key by
+      key, including both sha256 digests, so a stale manifest cannot claim a run
+      that read different bytes;
+    - the declared per-side fee must be the fee the overlay really charges;
+    - every declared cost must be an explicit finite JSON number, and the only
+      slippage the replay can match is exactly 0.0: an absent, null, empty,
+      boolean or string cost is a missing measurement, never an implied zero.
+
+    Do not weaken these to make a claim true: a claim that cannot survive them is
+    not a smaller claim, it is a false one.
     """
     cost = cfg.get("research_cost_model")
     overlay = cfg.get("house_overlay")
@@ -381,30 +703,88 @@ def applied_cost_matches_model(cfg):
         return False, "research cost model or house overlay is not declared"
     if cost.get("approved") is not True:
         return False, "research cost model is not approved"
-    if not FUNDING_APPLIED_TO_PNL:
+    declared = cost.get("funding")
+    declared_problems = problems_in_funding_identity(declared)
+    if declared_problems or not isinstance(declared, dict):
+        return False, ("the declared funding model is not a proven source identity: "
+                       + (declared_problems[0] if declared_problems else "not a JSON object"))
+    if not isinstance(applied, dict):
+        return False, ("funding is not applied to PnL, so no declared model can be proven equivalent "
+                       "(no applied funding evidence was supplied)")
+    if applied.get("funding_applied") is not True:
         return False, "funding is not applied to PnL, so no declared model can be proven equivalent"
-    try:
-        fee = float(cost.get("fees_per_side") or 0.0)
-        slippage = float(cost.get("slippage") or 0.0)
-        trade_cost = float(overlay.get("trade_cost") or 0.0)
-    except (TypeError, ValueError):
-        return False, "declared or applied cost is not numeric"
-    if slippage != 0.0:
+    if applied.get("reconciled") is not True:
+        return False, "funding was charged but does not reconcile with cycle PnL and account equity"
+    runtime = applied.get("identity")
+    runtime_problems = problems_in_funding_identity(runtime)
+    if runtime_problems or not isinstance(runtime, dict):
+        return False, ("the runtime funding identity is not usable: "
+                       + (runtime_problems[0] if runtime_problems else "not a JSON object"))
+    mismatch = [key for key in FUNDING_IDENTITY_KEYS if runtime[key] != declared[key]]
+    if mismatch:
+        return False, ("the declared funding identity does not match the source this run applied: "
+                       + ",".join(mismatch))
+    declared_costs = {}
+    for where, block, key in (
+        ("research_cost_model", cost, "fees_per_side"),
+        ("research_cost_model", cost, "slippage"),
+        ("house_overlay", overlay, "trade_cost"),
+    ):
+        number, problem = declared_cost_number(block, key, where)
+        if problem:
+            return False, problem
+        declared_costs[key] = number
+    if declared_costs["slippage"] != 0.0:
         return False, "slippage is declared but the replay applies none"
-    if fee != trade_cost:
+    if declared_costs["fees_per_side"] != declared_costs["trade_cost"]:
         return False, "the declared per-side fee is not the fee the overlay applies"
-    return True, "the declared model equals the applied fee-only economics"
+    return True, (
+        "the declared model equals the applied economics: 2 * house_overlay.trade_cost per filled stage and "
+        "%d verified funding event(s) totalling %.12g quote from %s"
+        % (int(applied.get("event_count") or 0), float(applied.get("total_payment_quote") or 0.0),
+           runtime.get("basis"))
+    )
 
 
-def performance_claimable(cfg, metrics):
+def performance_claimable(cfg, metrics, applied=None):
     """True only when applied economics match an approved model and metrics are defined."""
-    matches, _ = applied_cost_matches_model(cfg)
+    matches, _ = applied_cost_matches_model(cfg, applied)
     return bool(
         matches
         and metrics.get("total_trades", 0) > 0
         and metrics.get("cagr_pct") is not None
         and metrics.get("sharpe") is not None
     )
+
+
+def funding_reconciles(records, metrics, initial_capital, total_funding):
+    """Return True only when every funding payment is visible in cycle PnL and equity.
+
+    Four identities must hold at once, so a payment that lands in the evidence but
+    not in the PnL (or the other way round) can never pass as reconciled:
+
+    - each cycle paid exactly the sum of the events attributed to it;
+    - each cycle's net realized PnL is its own DCA result minus exactly those events;
+    - the run total is the sum of every individual payment;
+    - net profit is the sum of cycle net PnL, and end equity is initial + net profit.
+    """
+    tolerance = 1e-9 * max(1.0, abs(float(initial_capital)))
+    charged = 0.0
+    for record in records:
+        own = float(sum(charge["payment_quote"] for charge in record["funding_events"]))
+        charged += own
+        if abs(own - float(record["funding_paid_quote"])) > tolerance:
+            return False
+        if abs(float(record["realized_pnl_quote"]) - (float(record["dca_net_pnl_quote"]) - own)) > tolerance:
+            return False
+    if abs(charged - float(total_funding)) > tolerance:
+        return False
+    realized_total = float(sum(float(record["realized_pnl_quote"]) for record in records))
+    if abs(float(metrics["net_profit_usdt"]) - realized_total) > tolerance:
+        return False
+    if abs(float(metrics["end_equity_quote"]) - (float(initial_capital) + realized_total)) > tolerance:
+        return False
+    return True
 
 
 def plan_cycles(rows, first_eval_index, last_eval_index):
@@ -446,7 +826,13 @@ def plan_cycles(rows, first_eval_index, last_eval_index):
 
 
 def cycle_frame(rows, entry_index, exit_index):
-    """Return the DCA input frame for one cycle: entry bar through close boundary."""
+    """Return the DCA input frame for one cycle: entry bar through close boundary.
+
+    ``timestamp`` is the primitive's own epoch-seconds column and stays exactly as
+    PR #12 shipped it. Funding never reads it: stage fills are mapped back to a row
+    offset and priced at ``bar_close_ms``, so a naive ``.timestamp()`` (which reads
+    a naive UTC datetime as host-local) can never leak into a funding boundary.
+    """
     import pandas as pd
 
     span = range(entry_index, exit_index + 1)
@@ -462,10 +848,86 @@ def cycle_frame(rows, entry_index, exit_index):
     return frame
 
 
-def replay_cycles(rows, cycles, overlay, leverage, simulator=None):
-    """Run one house DCA overlay per source cycle and return the cycle records."""
+def cycle_funding_charges(rows, timeframe, prices, amounts, ledger, entry_index, close_index, funding):
+    """Return the funding events one cycle must pay, in boundary order.
+
+    Position state is reconstructed from the DCA ledger itself: a stage column
+    becomes non-zero on the bar whose close triggered that stage, so its first
+    non-zero offset is the fill bar and every quantity and boundary is derived from
+    that bar rather than from the ledger's epoch column.
+
+    Pinned ordering (both sides at bar CLOSEs):
+
+    - a stage first filled at close T is not charged for an event at T, because it
+      was not held during the interval the event pays for;
+    - a cycle closing at close T is charged for an event at T, because it was held
+      through that interval;
+    - an event after the cycle's close boundary is never charged: the account is
+      flat from that boundary on, whatever the source state says.
+    """
+    if not funding or not funding.get("events"):
+        return []
+    close_boundary = bar_close_ms(rows, close_index, timeframe)
+    fill_closes = []
+    for level in range(len(prices)):
+        column = ledger.get("filled_amount_quote_%d" % level)
+        offset = None
+        if column is not None:
+            for candidate in range(len(column)):
+                if float(column.iloc[candidate]) > 0.0:
+                    offset = candidate
+                    break
+        fill_closes.append(None if offset is None else bar_close_ms(rows, entry_index + offset, timeframe))
+    charges = []
+    for event in funding["events"]:
+        boundary = event["boundary_ms"]
+        if boundary > close_boundary:
+            continue
+        held_base = 0.0
+        for level, (price, amount) in enumerate(zip(prices, amounts)):
+            if fill_closes[level] is None or fill_closes[level] >= boundary:
+                continue
+            held_base += float(amount / price)
+        if held_base <= 0.0:
+            continue
+        charge_index = None
+        for candidate in range(entry_index, close_index + 1):
+            if bar_close_ms(rows, candidate, timeframe) >= boundary:
+                charge_index = candidate
+                break
+        if charge_index is None:
+            raise SystemExit("HOLD: funding event at %d has no boundary inside its own cycle" % boundary)
+        charges.append(
+            {
+                "funding_time_ms": event["funding_time_ms"],
+                "funding_time_utc": funding_iso(event["funding_time_ms"]),
+                "boundary_ms": boundary,
+                "boundary_utc": funding_iso(boundary),
+                "funding_rate": event["funding_rate"],
+                "mark_price": event["mark_price"],
+                "mark_price_source": event["mark_price_source"],
+                "truth_status": event["truth_status"],
+                "held_base_qty": held_base,
+                "payment_quote": held_base * event["mark_price"] * event["funding_rate"],
+                "charge_index": charge_index,
+                "charge_bar_ts": rows[charge_index]["datetime"],
+            }
+        )
+    return charges
+
+
+def replay_cycles(rows, cycles, overlay, leverage, timeframe=None, simulator=None, funding=None):
+    """Run one house DCA overlay per source cycle and return the cycle records.
+
+    ``timeframe`` is required whenever funding is charged: the bar CLOSE boundary
+    comes from the frozen interval, and guessing the interval would silently move
+    every payment. ``record["realized_pnl_quote"]`` is net of the funding the cycle
+    paid; ``record["dca_net_pnl_quote"]`` keeps the primitive's own number.
+    """
+    if funding:
+        bar_close_ms(rows, 0, timeframe)  # fail closed on a missing/unknown timeframe
     records = []
-    for cycle in cycles:
+    for number, cycle in enumerate(cycles, start=1):
         entry_index, exit_index = cycle["entry_index"], cycle["exit_index"]
         entry_price = rows[entry_index]["close"]
         prices = stage_prices(entry_price, overlay["so_spacing_pct"], overlay["safety_order_levels"])
@@ -490,15 +952,29 @@ def replay_cycles(rows, cycles, overlay, leverage, simulator=None):
         close_index = entry_index + len(ledger) - 1
         if close_index > exit_index:
             raise SystemExit("HOLD: the house DCA overlay closed after the cycle boundary at bar %d" % entry_index)
-        realized = float(ledger["net_pnl_quote"].iloc[-1])
+        dca_realized = float(ledger["net_pnl_quote"].iloc[-1])
         overlay_exit = dca_close_type in OVERLAY_CLOSE_TYPES
-        pnl_by_index = {
+        dca_pnl_by_index = {
             entry_index + offset: float(ledger["net_pnl_quote"].iloc[offset]) for offset in range(len(ledger))
         }
         # The overlay is flat from its own exit bar on; the source stays long
         # until its exit, so the cycle's realized PnL is simply carried.
         for index in range(close_index + 1, exit_index + 1):
-            pnl_by_index[index] = realized
+            dca_pnl_by_index[index] = dca_realized
+        charges = cycle_funding_charges(
+            rows, timeframe, prices, amounts, ledger, entry_index, close_index, funding
+        )
+        funding_paid = float(sum(charge["payment_quote"] for charge in charges))
+        funding_by_index = {}
+        for charge in charges:
+            funding_by_index[charge["charge_index"]] = (
+                funding_by_index.get(charge["charge_index"], 0.0) + charge["payment_quote"]
+            )
+        pnl_by_index, funding_cum_by_index, running = {}, {}, 0.0
+        for index in range(entry_index, exit_index + 1):
+            running += funding_by_index.get(index, 0.0)
+            funding_cum_by_index[index] = running
+            pnl_by_index[index] = dca_pnl_by_index[index] - running
         stages = []
         for level, (price, amount) in enumerate(zip(prices, amounts)):
             filled = ledger.get("filled_amount_quote_%d" % level)
@@ -512,6 +988,7 @@ def replay_cycles(rows, cycles, overlay, leverage, simulator=None):
             )
         records.append(
             {
+                "cycle": number,
                 "entry_index": entry_index,
                 "exit_index": exit_index,
                 "close_index": close_index,
@@ -524,12 +1001,16 @@ def replay_cycles(rows, cycles, overlay, leverage, simulator=None):
                 "close_reason": dca_close_type
                 if overlay_exit
                 else ("FORCE_FLAT" if cycle["forced"] else "STRATEGY_EXIT"),
-                "realized_pnl_quote": realized,
+                "dca_net_pnl_quote": dca_realized,
+                "funding_paid_quote": funding_paid,
+                "realized_pnl_quote": dca_realized - funding_paid,
                 "max_exposure_quote": float(max(ledger["filled_amount_quote"])),
                 "ledger_rows": int(len(ledger)),
                 "stage_prices": [float(value) for value in prices],
                 "stage_quote_amounts": [float(value) for value in amounts],
                 "stages": stages,
+                "funding_events": charges,
+                "funding_cum_by_index": funding_cum_by_index,
                 "pnl_by_index": pnl_by_index,
             }
         )
@@ -539,20 +1020,23 @@ def replay_cycles(rows, cycles, overlay, leverage, simulator=None):
 def equity_projection(eval_indices, records, initial_capital):
     """Return one account-equity bar per evaluation-window bar.
 
-    Realized PnL of finished cycles carries forward, the open cycle contributes
-    its own DCA ledger mark to market, and every bar of the window is present so
-    a reader can see flat periods. ``filled_amount_quote`` never enters here.
+    Realized net PnL of finished cycles carries forward, the open cycle contributes
+    its own DCA ledger mark to market minus the funding it has been charged so far,
+    and every bar of the window is present so a reader can see flat periods.
+    ``filled_amount_quote`` never enters here.
     """
-    projection, carried, cursor = [], 0.0, 0
+    projection, carried, carried_funding, cursor = [], 0.0, 0.0, 0
     for bar in eval_indices:
         while cursor < len(records) and records[cursor]["exit_index"] < bar:
             carried += records[cursor]["realized_pnl_quote"]
+            carried_funding += records[cursor]["funding_paid_quote"]
             cursor += 1
-        position, number, mark = "flat", None, 0.0
+        position, number, mark, funding = "flat", None, 0.0, 0.0
         if cursor < len(records) and records[cursor]["entry_index"] <= bar:
             record = records[cursor]
             number = cursor + 1
             mark = record["pnl_by_index"].get(bar, record["realized_pnl_quote"])
+            funding = record["funding_cum_by_index"].get(bar, record["funding_paid_quote"])
             position = "long" if bar <= record["close_index"] else "source_long"
         projection.append(
             {
@@ -561,6 +1045,7 @@ def equity_projection(eval_indices, records, initial_capital):
                 "cycle_number": number,
                 "realized_pnl_quote": carried,
                 "mark_pnl_quote": mark,
+                "funding_paid_quote": carried_funding + funding,
             }
         )
     for bar, value in zip(
@@ -571,8 +1056,9 @@ def equity_projection(eval_indices, records, initial_capital):
     return projection
 
 
-def metrics_from_equity(timestamps, equity, realized_pnls, periods_per_year, initial_capital):
-    """Return required fee-inclusive metrics using frozen initial capital as the baseline."""
+def metrics_from_equity(timestamps, equity, realized_pnls, periods_per_year, initial_capital,
+                        funding_paid_quote=None):
+    """Return required fee-and-funding-inclusive metrics using frozen initial capital as the baseline."""
     if not equity or len(timestamps) != len(equity):
         raise SystemExit("HOLD: the evaluation window produced no usable equity series")
     start = float(initial_capital)
@@ -595,7 +1081,7 @@ def metrics_from_equity(timestamps, equity, realized_pnls, periods_per_year, ini
     losers = [value for value in realized_pnls if value < 0]
     gross_loss = -sum(losers)
     total = len(realized_pnls)
-    return {
+    metrics = {
         "net_return_pct": (end / start - 1.0) * 100.0,
         "cagr_pct": cagr,
         "sharpe": sharpe,
@@ -614,6 +1100,9 @@ def metrics_from_equity(timestamps, equity, realized_pnls, periods_per_year, ini
         "max_drawdown_definition": REPLAY_DEFINITIONS["max_drawdown_pct"],
         "definitions": dict(REPLAY_DEFINITIONS),
     }
+    if funding_paid_quote is not None:
+        metrics["funding_paid_quote"] = float(funding_paid_quote)
+    return metrics
 
 
 def trades_fieldnames(stage_count):
@@ -627,6 +1116,8 @@ def trades_fieldnames(stage_count):
         "dca_close_type",
         "forced_flat",
         "entry_price",
+        "dca_net_pnl_quote",
+        "funding_paid_quote",
         "realized_pnl_quote",
         "max_exposure_quote",
         "ledger_rows",
@@ -634,6 +1125,24 @@ def trades_fieldnames(stage_count):
     for level in range(stage_count):
         names += ["stage_%d_price" % level, "stage_%d_quote" % level, "stage_%d_filled_quote" % level]
     return names
+
+
+def funding_event_fieldnames():
+    """Return the funding_events.csv header, in the order the evidence is read."""
+    return [
+        "cycle",
+        "funding_time_utc",
+        "funding_time_ms",
+        "funding_boundary_utc",
+        "funding_boundary_ms",
+        "funding_rate",
+        "mark_price",
+        "mark_price_source",
+        "truth_status",
+        "held_base_qty",
+        "payment_quote",
+        "charge_bar_utc",
+    ]
 
 
 def write_evidence(out_dir, summary, signal_rows, records, evaluation_times, projection, metrics):
@@ -669,6 +1178,8 @@ def write_evidence(out_dir, summary, signal_rows, records, evaluation_times, pro
                 "dca_close_type": record["dca_close_type"],
                 "forced_flat": int(record["forced"]),
                 "entry_price": record["entry_price"],
+                "dca_net_pnl_quote": record["dca_net_pnl_quote"],
+                "funding_paid_quote": record["funding_paid_quote"],
                 "realized_pnl_quote": record["realized_pnl_quote"],
                 "max_exposure_quote": record["max_exposure_quote"],
                 "ledger_rows": record["ledger_rows"],
@@ -709,6 +1220,7 @@ def write_evidence(out_dir, summary, signal_rows, records, evaluation_times, pro
                 "bar_return",
                 "realized_pnl_quote",
                 "mark_pnl_quote",
+                "funding_paid_quote",
                 "position_state",
                 "cycle_number",
             ],
@@ -722,11 +1234,36 @@ def write_evidence(out_dir, summary, signal_rows, records, evaluation_times, pro
                     "bar_return": bar["bar_return"],
                     "realized_pnl_quote": bar["realized_pnl_quote"],
                     "mark_pnl_quote": bar["mark_pnl_quote"],
+                    "funding_paid_quote": bar["funding_paid_quote"],
                     "position_state": bar["position_state"],
                     "cycle_number": "" if bar["cycle_number"] is None else bar["cycle_number"],
                 }
             )
-    return ["summary.json", "signals.csv", "trades.csv", "events.csv", "equity.csv", "metrics.json"]
+    # One row per charged funding event. A cell that held nothing during the window
+    # writes the header only, so the file is never mistaken for a zero-fill.
+    with (out_dir / "funding_events.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=funding_event_fieldnames())
+        writer.writeheader()
+        for number, record in enumerate(records, start=1):
+            for charge in record["funding_events"]:
+                writer.writerow(
+                    {
+                        "cycle": number,
+                        "funding_time_utc": charge["funding_time_utc"],
+                        "funding_time_ms": charge["funding_time_ms"],
+                        "funding_boundary_utc": charge["boundary_utc"],
+                        "funding_boundary_ms": charge["boundary_ms"],
+                        "funding_rate": charge["funding_rate"],
+                        "mark_price": charge["mark_price"],
+                        "mark_price_source": charge["mark_price_source"],
+                        "truth_status": charge["truth_status"],
+                        "held_base_qty": charge["held_base_qty"],
+                        "payment_quote": charge["payment_quote"],
+                        "charge_bar_utc": charge["charge_bar_ts"].isoformat(),
+                    }
+                )
+    return ["summary.json", "signals.csv", "trades.csv", "events.csv", "funding_events.csv",
+            "equity.csv", "metrics.json"]
 
 
 def write_manifest(out_dir):
@@ -844,8 +1381,31 @@ def build_effective_config(spec, identity, artifact_sha256):
         "house_overlay": dict(spec["house_overlay"]),
         "research_cost_model": dict(spec["research_cost_model"]),
         "economics_boundary": {
+            # Every scope statement here is persisted in effective_config.json, in
+            # summary.json and (via the repro artifacts) in MLflow, so it must
+            # describe exactly what this replay does. Funding is applied, not
+            # "unmodeled": only the isolated-margin account mechanics and slippage
+            # are absent from the Qlib replay.
+            "research_leverage_scope": "exposure multiplier only: research_leverage scales every DCA stage's "
+                                       "quote allocation, so it scales exposure and PnL; it is not a margin "
+                                       "balance, a leverage maintenance rule or a liquidation model",
             "research_leverage_is_exposure_multiplier": True,
-            "isolated_margin_funding_slippage": "not modeled here; Node13 Hummingbot owns canonical economics",
+            "isolated_margin": "not modeled in this Qlib replay: no isolated-margin balance, maintenance "
+                               "margin, liquidation price or position limit is simulated, so a replay can "
+                               "never be read as a margin-account result",
+            "slippage": "not applied: every fill uses the frozen bar-close reference price of the DCA "
+                        "primitive, so a declared research cost model is equivalent only when its "
+                        "slippage is exactly 0.0 and no other slippage is ever assumed",
+            "funding": "applied from a verified structured source identity: when research_cost_model."
+                       "funding is the binance-usdm-funding-v1 identity, every held-through event is "
+                       "charged into the same bar's equity and the identity is re-verified against the "
+                       "source bytes; when it is the explicit not_modeled declaration the cell stays "
+                       "runnable with funding absent from PnL and performance_claimable false, and "
+                       "funding is never zero-filled",
+            "funding_scope": "conditional_verified_identity_else_not_modeled_unclaimable",
+            "final_execution_and_certification": "Node13 Hummingbot owns canonical execution economics, "
+                                                 "live fee/funding rates and certification; this replay is "
+                                                 "research evidence, not the certified economics",
         },
     }
 
@@ -1040,22 +1600,52 @@ def run_cell(cell_dir, out_dir, simulator=None):
 
     overlay = cfg["house_overlay"]
     cycles, skipped_cycles = plan_cycles(rows, eval_indices[0], eval_indices[-1])
-    records = replay_cycles(rows, cycles, overlay, cfg["research_leverage"], simulator=simulator)
+    # Funding: the frozen window is the set of bar CLOSE boundaries a cycle can be
+    # charged at, so the series is read once for exactly that interval. An identity
+    # must resolve or the run holds; the explicit ``not_modeled`` declaration keeps
+    # a legacy cell runnable, unclaimable, and honest about it.
+    declared_funding = (cfg.get("research_cost_model") or {}).get("funding")
+    funding = None
+    if isinstance(declared_funding, dict):
+        funding = load_funding_series(
+            declared_funding,
+            symbol,
+            bar_close_ms(rows, eval_indices[0], timeframe),
+            bar_close_ms(rows, eval_indices[-1], timeframe),
+        )
+    records = replay_cycles(rows, cycles, overlay, cfg["research_leverage"], timeframe,
+                            simulator=simulator, funding=funding)
     projection = equity_projection(eval_indices, records, float(overlay["initial_capital_quote"]))
     evaluation_times = [rows[index]["datetime"] for index in eval_indices]
     realized = [record["realized_pnl_quote"] for record in records]
+    total_funding = float(sum(record["funding_paid_quote"] for record in records))
+    initial_capital = float(overlay["initial_capital_quote"])
     metrics = metrics_from_equity(
         evaluation_times,
         [bar["equity_quote"] for bar in projection],
         realized,
         PERIODS_PER_YEAR[timeframe],
-        float(overlay["initial_capital_quote"]),
+        initial_capital,
+        funding_paid_quote=total_funding,
     )
-    cost_matches, cost_reason = applied_cost_matches_model(cfg)
-    claimable = performance_claimable(cfg, metrics)
+    applied = {
+        "funding_applied": funding is not None,
+        "identity": None if funding is None else funding["identity"],
+        "event_count": int(sum(len(record["funding_events"]) for record in records)),
+        "total_payment_quote": total_funding,
+        "reconciled": funding_reconciles(records, metrics, initial_capital, total_funding),
+    }
+    if not applied["reconciled"]:
+        raise SystemExit("HOLD: funding was charged but does not reconcile with cycle PnL and equity")
+    cost_matches, cost_reason = applied_cost_matches_model(cfg, applied)
+    claimable = performance_claimable(cfg, metrics, applied)
     close_reasons = {}
     for record in records:
         close_reasons[record["close_reason"]] = close_reasons.get(record["close_reason"], 0) + 1
+    charged_status = {}
+    for record in records:
+        for charge in record["funding_events"]:
+            charged_status[charge["truth_status"]] = charged_status.get(charge["truth_status"], 0) + 1
     summary = {
         "engine": "qlib.backtest.research_cell / backtest_hummingbot_dca (house DCA overlay)",
         "qlib_version": importlib.metadata.version("pyqlib"),
@@ -1078,6 +1668,8 @@ def run_cell(cell_dir, out_dir, simulator=None):
         "close_type": records[0]["dca_close_type"] if len(records) == 1 else None,
         "max_exposure_quote": max((record["max_exposure_quote"] for record in records), default=0.0),
         "net_pnl_quote": float(sum(realized)),
+        "funding_paid_quote": total_funding,
+        "funding_charged_events": applied["event_count"],
         "ledger_rows": int(sum(record["ledger_rows"] for record in records)),
         "cycles": [
             {
@@ -1092,6 +1684,9 @@ def run_cell(cell_dir, out_dir, simulator=None):
                 "stage_prices": record["stage_prices"],
                 "stage_quote_amounts": record["stage_quote_amounts"],
                 "stages": record["stages"],
+                "dca_net_pnl_quote": record["dca_net_pnl_quote"],
+                "funding_paid_quote": record["funding_paid_quote"],
+                "funding_events": len(record["funding_events"]),
                 "realized_pnl_quote": record["realized_pnl_quote"],
                 "max_exposure_quote": record["max_exposure_quote"],
                 "ledger_rows": record["ledger_rows"],
@@ -1105,13 +1700,29 @@ def run_cell(cell_dir, out_dir, simulator=None):
                                    performance_claimable=claimable),
         "applied_economics": {
             "applied": "2 * house_overlay.trade_cost of each filled DCA stage's quote amount, from that "
-                       "stage's entry bar onward (frozen primitive semantics; not per-fill event timing)",
+                       "stage's entry bar onward (frozen primitive semantics; not per-fill event timing), "
+                       "plus every verified Binance USD-M funding event this cycle held through",
             "slippage_applied": False,
-            "funding_applied": False,
+            "funding_applied": applied["funding_applied"],
+            "funding_declaration": declared_funding if not isinstance(declared_funding, dict)
+            else "structured source identity",
+            "funding_total_payment_quote": total_funding,
+            "funding_charged_event_count": applied["event_count"],
+            "funding_reconciled": applied["reconciled"],
+            "funding_truth_status_counts": {} if funding is None else funding["truth_status_counts"],
+            "funding_charged_truth_status_counts": charged_status,
+            "funding_basis": None if funding is None else funding["identity"]["basis"],
+            "funding_source_ref": None if funding is None else funding["identity"]["source_ref"],
+            "funding_source_sha256": None if funding is None else funding["identity"]["source_sha256"],
+            "funding_modeled_mark_basis": None if funding is None else funding["identity"]["modeled_mark_basis"],
+            "funding_modeled_mark_snapshot_sha256": None
+            if funding is None else funding["identity"]["modeled_mark_snapshot_sha256"],
+            "funding_modeled_mark_files": {} if funding is None else funding["mark_snapshot"],
             "declared_model_matches_applied": cost_matches,
             "declared_model_match_reason": cost_reason,
         },
-        "metrics_scope": "metrics.json holds the fee-inclusive account-equity metrics and their definitions",
+        "metrics_scope": "metrics.json holds the fee-and-funding-inclusive account-equity metrics and their "
+                         "definitions",
         # MLflow cannot store a null metric, so an undefined metric is absent from the
         # MLflow run and null in metrics.json. Listing it here keeps that visible.
         "mlflow_metrics_omitted": sorted(
@@ -1141,6 +1752,10 @@ def run_cell(cell_dir, out_dir, simulator=None):
                        "max_drawdown_definition": metrics["max_drawdown_definition"],
                        "bar_returns_ddof": str(metrics["bar_returns_ddof"]),
                        "periods_per_year": str(metrics["periods_per_year"]),
+                       "funding_basis": str(summary["applied_economics"]["funding_basis"]),
+                       "funding_source_sha256": str(summary["applied_economics"]["funding_source_sha256"]),
+                       "funding_modeled_mark_snapshot_sha256":
+                           str(summary["applied_economics"]["funding_modeled_mark_snapshot_sha256"]),
                        "close_reason_precedence": REPLAY_DEFINITIONS["close_reason_precedence"]}.items():
         client.log_param(run_id, key, value)
     logged = {
@@ -1154,6 +1769,8 @@ def run_cell(cell_dir, out_dir, simulator=None):
         "net_profit_usdt": metrics["net_profit_usdt"],
         "max_exposure_quote": summary["max_exposure_quote"],
         "net_pnl_quote": summary["net_pnl_quote"],
+        "funding_paid_quote": total_funding,
+        "funding_charged_events": applied["event_count"],
         "ledger_rows": summary["ledger_rows"],
         "cycles_replayed": len(records),
         "evaluation_bars": metrics["evaluation_bars"],

@@ -36,12 +36,13 @@ purpose: the repo keeps exactly one committed strategy fixture (Donchian) to
 prove a strategy rule survives outside the engine, not a strategy library.
 """
 
+import gzip
 import hashlib
 import importlib.util
 import json
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -750,25 +751,29 @@ def transition_rows(closes, entries=(), exits=(), start=None):
     ]
 
 
-def replay(rows, first=None, last=None, overlay=None, leverage=3, simulator=None):
+def replay(rows, first=None, last=None, overlay=None, leverage=3, simulator=None, funding=None,
+           timeframe="1h"):
     """Plan, replay and project one synthetic transition series end to end."""
     overlay = overlay or replay_overlay()
     first = 0 if first is None else first
     last = len(rows) - 1 if last is None else last
     cycles, skipped = cell.plan_cycles(rows, first, last)
-    records = cell.replay_cycles(rows, cycles, overlay, leverage,
-                                 simulator=simulator or dca.simulate_hummingbot_dca)
+    records = cell.replay_cycles(rows, cycles, overlay, leverage, timeframe,
+                                 simulator=simulator or dca.simulate_hummingbot_dca, funding=funding)
     indices = list(range(first, last + 1))
     projection = cell.equity_projection(indices, records, float(overlay["initial_capital_quote"]))
+    total_funding = float(sum(record["funding_paid_quote"] for record in records))
     metrics = cell.metrics_from_equity(
         [rows[index]["datetime"] for index in indices],
         [bar["equity_quote"] for bar in projection],
         [record["realized_pnl_quote"] for record in records],
-        cell.PERIODS_PER_YEAR["1h"],
+        cell.PERIODS_PER_YEAR[timeframe],
         float(overlay["initial_capital_quote"]),
+        funding_paid_quote=total_funding,
     )
     return {"cycles": cycles, "skipped": skipped, "records": records, "projection": projection,
-            "metrics": metrics, "indices": indices, "overlay": overlay}
+            "metrics": metrics, "indices": indices, "overlay": overlay, "funding": funding,
+            "funding_paid_quote": total_funding}
 
 
 def two_cycle_series():
@@ -809,8 +814,11 @@ def test_cost_model_equivalence_gates_performance_claimable():
     matches, reason = cell.applied_cost_matches_model(frozen)
     check("the frozen canonical cost model is not approved", matches is False and "not approved" in reason,
           reason)
-    check("the replay applies no funding, so net performance cannot be claimed",
-          cell.FUNDING_APPLIED_TO_PNL is False, cell.FUNDING_APPLIED_TO_PNL)
+    check("the replay carries the frozen Binance USD-M funding identity constants",
+          cell.FUNDING_BASIS == "binance-usdm-funding-v1"
+          and cell.FUNDING_MODELED_MARK_BASIS == "binance-usdm-mark-1h-open-v1"
+          and cell.FUNDING_TRUTH_STATUS == ("official", "modeled_funding"),
+          (cell.FUNDING_BASIS, cell.FUNDING_MODELED_MARK_BASIS, cell.FUNDING_TRUTH_STATUS))
     approved = cell_config()
     approved["research_cost_model"]["approved"] = True
     matches, reason = cell.applied_cost_matches_model(approved)
@@ -1151,11 +1159,13 @@ def test_evidence_files_and_manifest_cover_the_whole_window():
     names = cell.write_evidence(tmp, {"symbol": "BTCUSDT", "cycles_replayed": 2}, rows, run["records"],
                                 evaluation_times, run["projection"], run["metrics"])
     manifest = cell.write_manifest(tmp)
-    required = ["summary.json", "signals.csv", "trades.csv", "events.csv", "equity.csv", "metrics.json"]
+    required = ["summary.json", "signals.csv", "trades.csv", "events.csv", "funding_events.csv",
+                "equity.csv", "metrics.json"]
     check("every required evidence file is written",
           all((tmp / name).is_file() for name in required), sorted(p.name for p in tmp.iterdir()))
     check("write_evidence names exactly the non-MLflow evidence it wrote",
-          names == ["summary.json", "signals.csv", "trades.csv", "events.csv", "equity.csv", "metrics.json"],
+          names == ["summary.json", "signals.csv", "trades.csv", "events.csv", "funding_events.csv",
+                    "equity.csv", "metrics.json"],
           names)
     with (tmp / "equity.csv").open(newline="", encoding="utf-8") as handle:
         equity_rows = list(csv.DictReader(handle))
@@ -1209,6 +1219,594 @@ def test_zero_cycle_events_file_keeps_the_transport_shape():
     check("a zero-cycle run writes the events header but no invented stage row", len(lines) == 1, lines)
     check("so the pinned transport's execution count cannot be satisfied by a no-trade cell",
           len(lines) < 2 and run["records"] == [], (len(lines), run["records"]))
+
+
+# ------------------------------------------------------- funding model fixtures
+#
+# The funding source is registered raw data, so the fixtures use the registered
+# layout (``<root>/funding/<SYMBOL>/...`` beside ``<root>/mark/<SYMBOL>/1h/...``)
+# instead of a hand-built dict: the identity hash and the modeled-mark
+# reconstruction are then exercised through the same code path a real run uses.
+
+FUNDING_SYMBOL = "BTCUSDT"
+FUNDING_START = datetime(2025, 5, 1)
+
+
+def funding_boundary(index, interval_hours=1, start=FUNDING_START):
+    """Return one synthetic bar's UTC-hour CLOSE boundary, computed independently."""
+    moment = (start + timedelta(hours=index + interval_hours)).replace(tzinfo=timezone.utc)
+    return int(moment.timestamp() * 1000)
+
+
+def write_funding_fixture(root, rows, mark_bars=(), symbol=FUNDING_SYMBOL):
+    """Write the registered funding + 1h mark layout and return its source identity.
+
+    ``mark_bars`` carries ``(open_time_ms, open[, close])``. Where a test must prove
+    the reconstruction reads the bar's OPEN, it passes a deliberately different
+    close.
+    """
+    root = Path(root)
+    funding_dir = root / "funding" / symbol
+    funding_dir.mkdir(parents=True, exist_ok=True)
+    source = funding_dir / ("%s-funding.jsonl.gz" % symbol)
+    payloads = [
+        json.dumps({
+            "symbol": row.get("symbol", symbol),
+            "venue": "BINANCE",
+            "market_type": "usdm_perp",
+            "funding_time_ms": row["funding_time_ms"],
+            "funding_rate": row.get("funding_rate", "0.0001"),
+            "mark_price": row.get("mark_price"),
+            "rate_type": row.get("rate_type", "Regular"),
+            "truth_status": row.get("truth_status", "official"),
+            "funding_price_source": row.get("funding_price_source"),
+        })
+        for row in rows
+    ]
+    with gzip.open(source, "wt", encoding="utf-8") as handle:
+        handle.write("\n".join(payloads) + "\n")
+    mark_dir = root / "mark" / symbol / "1h"
+    mark_dir.mkdir(parents=True, exist_ok=True)
+    per_month = {}
+    for bar in mark_bars:
+        stamp_ms, open_price = int(bar[0]), bar[1]
+        close_price = bar[2] if len(bar) > 2 and bar[2] is not None else open_price
+        month = datetime.fromtimestamp(stamp_ms / 1000.0, tz=timezone.utc)
+        per_month.setdefault((month.year, month.month), []).append((stamp_ms, open_price, close_price))
+    used = {}
+    for (year, month), bars in sorted(per_month.items()):
+        name = "%s-1h-%04d-%02d.jsonl.gz" % (symbol, year, month)
+        path = mark_dir / name
+        with gzip.open(path, "wt", encoding="utf-8") as handle:
+            handle.write("\n".join(
+                json.dumps({"open_time_ms": stamp, "open": str(open_price), "close": str(close_price)})
+                for stamp, open_price, close_price in bars) + "\n")
+        used["%s/1h/%s" % (symbol, name)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "basis": cell.FUNDING_BASIS,
+        "source_ref": str(source),
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "truth_status": list(cell.FUNDING_TRUTH_STATUS),
+        "modeled_mark_basis": cell.FUNDING_MODELED_MARK_BASIS,
+        "modeled_mark_snapshot_sha256": cell.modeled_mark_snapshot(used),
+    }
+
+
+def official_event(boundary_ms, rate="0.0001", mark="100.0", **extra):
+    """Return one official funding row on the frozen envelope."""
+    row = {
+        "funding_time_ms": boundary_ms,
+        "funding_rate": rate,
+        "mark_price": mark,
+        "truth_status": "official",
+        "funding_price_source": "binance_funding_history_mark_price",
+    }
+    row.update(extra)
+    return row
+
+
+def modeled_event(boundary_ms, rate="0.0001", **extra):
+    """Return one modeled_funding row: a registered rate and no official mark."""
+    row = {"funding_time_ms": boundary_ms, "funding_rate": rate, "mark_price": None,
+           "truth_status": "modeled_funding", "funding_price_source": None}
+    row.update(extra)
+    return row
+
+
+def load_fixture_funding(identity, rows, symbol=FUNDING_SYMBOL, first=0, last=None):
+    """Load one fixture series over exactly the bar-close window a replay would charge."""
+    last = (len(rows) - 1) if last is None else last
+    return cell.load_funding_series(identity, symbol, funding_boundary(first), funding_boundary(last))
+
+
+def flat_cycle_rows(count=8, entries=(1,), exits=None):
+    """A window whose prices never move, so only the base DCA stage ever fills."""
+    exits = (count - 2,) if exits is None else exits
+    return transition_rows([100.0] * count, entries=set(entries), exits=set(exits))
+
+
+def funding_applied_for(run, initial_capital):
+    """Return the applied-economics object a run reports for its own funding charges."""
+    return {
+        "funding_applied": run["funding"] is not None,
+        "identity": None if run["funding"] is None else run["funding"]["identity"],
+        "event_count": int(sum(len(record["funding_events"]) for record in run["records"])),
+        "total_payment_quote": run["funding_paid_quote"],
+        "reconciled": cell.funding_reconciles(run["records"], run["metrics"], initial_capital,
+                                              run["funding_paid_quote"]),
+    }
+
+
+def test_a_b_positive_and_negative_funding_move_pnl_exactly():
+    """A paid funding event subtracts exactly; a received one adds exactly."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-ab-"))
+    paid_identity = write_funding_fixture(tmp / "paid", [official_event(funding_boundary(2), "0.0001")])
+    rows = flat_cycle_rows()
+    paid = replay(rows, funding=load_fixture_funding(paid_identity, rows))
+    record = paid["records"][0]
+    initial = float(paid["overlay"]["initial_capital_quote"])
+    check("the fixture series carries exactly one official event",
+          len(paid["funding"]["events"]) == 1, paid["funding"]["events"])
+    check("only the base DCA stage is held on a flat window",
+          [stage["filled_quote"] for stage in record["stages"]] == [18000.0, 0.0, 0.0],
+          record["stages"])
+    check("held base quantity is stage_quote / stage_price",
+          abs(record["funding_events"][0]["held_base_qty"] - 180.0) < 1e-12,
+          record["funding_events"][0]["held_base_qty"])
+    check("a positive funding rate is paid out of PnL",
+          abs(record["funding_events"][0]["payment_quote"] - 1.8) < 1e-12,
+          record["funding_events"][0]["payment_quote"])
+    check("the DCA primitive's own result is preserved for audit",
+          abs(record["dca_net_pnl_quote"] + 14.4) < 1e-9, record["dca_net_pnl_quote"])
+    check("cycle realized PnL is the DCA result minus the funding it paid",
+          abs(record["realized_pnl_quote"] - (record["dca_net_pnl_quote"] - 1.8)) < 1e-12,
+          (record["realized_pnl_quote"], record["dca_net_pnl_quote"]))
+    check("the payment lands on the bar whose close reaches the event boundary",
+          record["funding_events"][0]["charge_index"] == 2, record["funding_events"][0]["charge_index"])
+    check("equity is untouched before the charge bar",
+          abs(paid["projection"][1]["equity_quote"] - (initial - 14.4)) < 1e-9, paid["projection"][1])
+    check("equity on the charge bar drops by fee plus funding exactly",
+          abs(paid["projection"][2]["equity_quote"] - (initial - 14.4 - 1.8)) < 1e-9,
+          paid["projection"][2])
+    check("net profit is the funded PnL", abs(paid["metrics"]["net_profit_usdt"] + 16.2) < 1e-9,
+          paid["metrics"]["net_profit_usdt"])
+    check("end equity is initial capital plus funded net profit",
+          abs(paid["metrics"]["end_equity_quote"] - (initial - 16.2)) < 1e-9,
+          paid["metrics"]["end_equity_quote"])
+    check("metrics record the funding total",
+          abs(paid["metrics"]["funding_paid_quote"] - 1.8) < 1e-12, paid["metrics"]["funding_paid_quote"])
+    check("the funding reconciles against cycle PnL and equity",
+          cell.funding_reconciles(paid["records"], paid["metrics"], initial, paid["funding_paid_quote"]))
+
+    received_identity = write_funding_fixture(tmp / "received",
+                                              [official_event(funding_boundary(2), "-0.0001")])
+    received = replay(rows, funding=load_fixture_funding(received_identity, rows))
+    credit = received["records"][0]
+    check("a negative funding rate is received, exactly",
+          abs(credit["funding_events"][0]["payment_quote"] + 1.8) < 1e-12,
+          credit["funding_events"][0]["payment_quote"])
+    check("a received amount raises cycle PnL by exactly that amount",
+          abs(credit["realized_pnl_quote"] - (credit["dca_net_pnl_quote"] + 1.8)) < 1e-12,
+          (credit["realized_pnl_quote"], credit["dca_net_pnl_quote"]))
+    check("a received amount raises equity on the charge bar",
+          abs(received["projection"][2]["equity_quote"] - (initial - 14.4 + 1.8)) < 1e-9,
+          received["projection"][2])
+    check("a received amount raises net profit",
+          abs(received["metrics"]["net_profit_usdt"] + 12.6) < 1e-9,
+          received["metrics"]["net_profit_usdt"])
+    check("paid and received differ by exactly twice the payment",
+          abs((paid["metrics"]["net_profit_usdt"] - received["metrics"]["net_profit_usdt"]) + 3.6) < 1e-9,
+          (paid["metrics"]["net_profit_usdt"], received["metrics"]["net_profit_usdt"]))
+
+
+def test_c_d_same_boundary_entry_does_not_pay_and_same_boundary_exit_does():
+    """The two pinned boundary cases, both stated at bar CLOSEs."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-cd-"))
+    rows = flat_cycle_rows()
+    entry_identity = write_funding_fixture(tmp / "entry", [official_event(funding_boundary(1))])
+    entry_run = replay(rows, funding=load_fixture_funding(entry_identity, rows))
+    record = entry_run["records"][0]
+    check("the base stage fills at the bar close that equals the event boundary",
+          record["stage_prices"][0] == 100.0 and record["entry_index"] == 1, record["entry_index"])
+    check("a stage filled at the event's own boundary pays nothing",
+          record["funding_events"] == [] and record["funding_paid_quote"] == 0.0,
+          record["funding_events"])
+    check("the same-boundary entry leaves the cycle on its DCA-only PnL",
+          abs(record["realized_pnl_quote"] - record["dca_net_pnl_quote"]) < 1e-12,
+          (record["realized_pnl_quote"], record["dca_net_pnl_quote"]))
+    check("the unfilled event is absent from the evidence rather than recorded as zero",
+          entry_run["metrics"]["funding_paid_quote"] == 0.0, entry_run["metrics"]["funding_paid_quote"])
+
+    exit_identity = write_funding_fixture(tmp / "exit", [official_event(funding_boundary(6))])
+    exit_run = replay(rows, funding=load_fixture_funding(exit_identity, rows))
+    closed = exit_run["records"][0]
+    check("the cycle closes on the bar whose close equals the event boundary",
+          closed["close_index"] == 6, closed["close_index"])
+    check("a position closing at the event's own boundary does pay",
+          len(closed["funding_events"]) == 1, closed["funding_events"])
+    check("the exit-boundary payment is charged on the closing bar",
+          closed["funding_events"][0]["charge_index"] == 6,
+          closed["funding_events"][0]["charge_index"])
+    check("the exit-boundary payment is the same held * mark * rate",
+          abs(closed["funding_events"][0]["payment_quote"] - 1.8) < 1e-12,
+          closed["funding_events"][0]["payment_quote"])
+
+
+def test_e_a_second_stage_fill_only_affects_later_funding_events():
+    """Held quantity steps up at the safety order's own fill boundary, never before."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-e-"))
+    rows = transition_rows([100.0, 100.0, 95.0, 95.0, 95.0, 95.0, 95.0], entries={1}, exits={6})
+    overlay = dict(replay_overlay(), take_profit_pct=None)
+    identity = write_funding_fixture(
+        tmp, [official_event(funding_boundary(2)), official_event(funding_boundary(3))])
+    run = replay(rows, funding=load_fixture_funding(identity, rows), overlay=overlay)
+    record = run["records"][0]
+    fills = [stage["filled_quote"] for stage in record["stages"]]
+    check("the base and the first safety order both fill", fills[0] > 0 and fills[1] > 0, fills)
+    check("the second safety order never fills", fills[2] == 0.0, fills)
+    charges = record["funding_events"]
+    check("both funding events are charged", len(charges) == 2, charges)
+    check("the event at the safety order's own fill boundary holds only the base stage",
+          abs(charges[0]["held_base_qty"] - 180.0) < 1e-12, charges[0]["held_base_qty"])
+    check("the next event holds base plus the filled safety order",
+          abs(charges[1]["held_base_qty"] - (180.0 + 18000.0 / 96.0)) < 1e-12, charges[1]["held_base_qty"])
+    check("so the second payment is larger than the first",
+          charges[1]["payment_quote"] > charges[0]["payment_quote"],
+          (charges[0]["payment_quote"], charges[1]["payment_quote"]))
+    check("the payments sum to the cycle's funding total",
+          abs(record["funding_paid_quote"] - sum(charge["payment_quote"] for charge in charges)) < 1e-12,
+          record["funding_paid_quote"])
+
+
+def test_f_overlay_early_exit_stops_funding_while_the_source_stays_long():
+    """The account is flat after the overlay's own exit, so nothing more is charged."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-f-"))
+    rows = transition_rows([100.0, 100.0, 103.0, 106.0, 104.0, 103.0, 104.0, 104.0, 104.0],
+                           entries={1, 7}, exits={6})
+    identity = write_funding_fixture(
+        tmp, [official_event(funding_boundary(4)), official_event(funding_boundary(8))])
+    run = replay(rows, funding=load_fixture_funding(identity, rows))
+    first, second = run["records"][0], run["records"][1]
+    check("the overlay closes cycle 1 before its source exit",
+          (first["close_index"], first["exit_index"]) == (3, 6),
+          (first["close_index"], first["exit_index"]))
+    check("an event between the overlay exit and the source exit is not charged to the flat cycle",
+          first["funding_events"] == [], first["funding_events"])
+    check("the account stays flat and source_long across that span",
+          [bar["position_state"] for bar in run["projection"][3:7]] == ["long", "source_long", "source_long", "source_long"],
+          [bar["position_state"] for bar in run["projection"][3:7]])
+    check("equity is carried, never re-marked, while the account is flat",
+          len({round(run["projection"][index]["equity_quote"], 9) for index in (3, 4, 5, 6)}) == 1,
+          [run["projection"][index]["equity_quote"] for index in (3, 4, 5, 6)])
+    check("the only charged event belongs to the cycle that is actually holding",
+          len(second["funding_events"]) == 1 and first["funding_paid_quote"] == 0.0,
+          (first["funding_paid_quote"], second["funding_paid_quote"]))
+    check("no funding is charged while the source state is source_long",
+          all(charge["charge_index"] <= second["close_index"] for charge in second["funding_events"]),
+          second["funding_events"])
+
+
+def test_g_modeled_funding_uses_the_1h_mark_open_and_records_provenance():
+    """A modeled row is charged from the 1h mark OPEN, and says so in the evidence."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-g-"))
+    boundary = funding_boundary(2)
+    identity = write_funding_fixture(
+        tmp, [modeled_event(boundary)], mark_bars=[(boundary, "123.45", "999.0")])
+    rows = flat_cycle_rows()
+    funding = load_fixture_funding(identity, rows)
+    run = replay(rows, funding=funding)
+    charge = run["records"][0]["funding_events"][0]
+    check("the modeled row keeps its registered rate",
+          abs(charge["funding_rate"] - 0.0001) < 1e-15, charge["funding_rate"])
+    check("the modeled mark is the 1h mark bar OPEN, not its close",
+          abs(charge["mark_price"] - 123.45) < 1e-12, charge["mark_price"])
+    check("the modeled mark price source is the reconstruction basis",
+          charge["mark_price_source"] == cell.FUNDING_MODELED_MARK_BASIS, charge["mark_price_source"])
+    check("the row is never relabeled as official", charge["truth_status"] == "modeled_funding",
+          charge["truth_status"])
+    check("the payment uses the reconstructed mark",
+          abs(charge["payment_quote"] - 180.0 * 123.45 * 0.0001) < 1e-12, charge["payment_quote"])
+    check("the series reports one modeled row in the window",
+          funding["truth_status_counts"] == {"modeled_funding": 1}, funding["truth_status_counts"])
+    check("the resolved identity names the modeled mark basis",
+          funding["identity"]["modeled_mark_basis"] == cell.FUNDING_MODELED_MARK_BASIS,
+          funding["identity"])
+    check("the resolved identity reproduces the declared snapshot digest",
+          funding["identity"]["modeled_mark_snapshot_sha256"] == identity["modeled_mark_snapshot_sha256"],
+          (funding["identity"]["modeled_mark_snapshot_sha256"], identity["modeled_mark_snapshot_sha256"]))
+    check("the snapshot names exactly the monthly file that was read",
+          list(funding["mark_snapshot"]) == ["BTCUSDT/1h/BTCUSDT-1h-2025-05.jsonl.gz"],
+          list(funding["mark_snapshot"]))
+    check("the raw jittered stamp is preserved as source evidence",
+          charge["funding_time_ms"] == boundary and charge["boundary_ms"] == boundary,
+          (charge["funding_time_ms"], charge["boundary_ms"]))
+
+
+def test_g2_a_jittered_modeled_stamp_floors_to_its_utc_hour():
+    """+6 ms of registered jitter must not move the event across a boundary."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-g2-"))
+    boundary = funding_boundary(2)
+    identity = write_funding_fixture(
+        tmp, [modeled_event(boundary + 6)], mark_bars=[(boundary, "123.45", "999.0")])
+    rows = flat_cycle_rows()
+    funding = load_fixture_funding(identity, rows)
+    check("the jittered stamp floors onto the UTC hour of its mark bar",
+          funding["events"][0]["boundary_ms"] == boundary, funding["events"][0])
+    check("the raw millisecond stamp is kept untouched",
+          funding["events"][0]["funding_time_ms"] == boundary + 6, funding["events"][0])
+    run = replay(rows, funding=funding)
+    charge = run["records"][0]["funding_events"][0]
+    check("the jittered event still charges exactly one payment",
+          abs(charge["payment_quote"] - 180.0 * 123.45 * 0.0001) < 1e-12, charge["payment_quote"])
+    check("the charge lands on the boundary bar, not on a later one",
+          charge["charge_index"] == 2, charge["charge_index"])
+
+
+def test_h_missing_modeled_mark_holds():
+    """A modeled row with no reconstructable mark must HOLD, never zero-fill."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-h-"))
+    rows = flat_cycle_rows()
+    no_bar = write_funding_fixture(
+        tmp / "no-bar", [modeled_event(funding_boundary(2))], mark_bars=[(funding_boundary(3), "123.45")])
+    check("a modeled row whose 1h mark bar is absent holds",
+          raised(lambda: load_fixture_funding(no_bar, rows), "no 1h mark bar"))
+    no_file = write_funding_fixture(tmp / "no-file", [modeled_event(funding_boundary(2))], mark_bars=[])
+    check("a modeled row whose monthly mark file is absent holds",
+          raised(lambda: load_fixture_funding(no_file, rows), "no 1h mark source"))
+    non_positive = write_funding_fixture(
+        tmp / "zero", [modeled_event(funding_boundary(2))], mark_bars=[(funding_boundary(2), "0")])
+    check("a non-positive reconstructed mark holds",
+          raised(lambda: load_fixture_funding(non_positive, rows), "not positive"))
+    duplicate = write_funding_fixture(
+        tmp / "dup", [modeled_event(funding_boundary(2))],
+        mark_bars=[(funding_boundary(2), "123.45"), (funding_boundary(2), "124.0")])
+    check("a duplicate 1h mark open_time holds instead of overwriting a bar",
+          raised(lambda: load_fixture_funding(duplicate, rows), "duplicate 1h mark open_time"))
+
+
+def test_i_a_wrong_source_or_mark_snapshot_digest_holds():
+    """The identity is a proof obligation: a stale digest must not run."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-i-"))
+    rows = flat_cycle_rows()
+    boundary = funding_boundary(2)
+    good = write_funding_fixture(tmp, [modeled_event(boundary)], mark_bars=[(boundary, "123.45")])
+    check("the untouched fixture loads", len(load_fixture_funding(good, rows)["events"]) == 1)
+    wrong_source = dict(good, source_sha256="0" * 64)
+    check("a wrong funding source sha256 holds",
+          raised(lambda: load_fixture_funding(wrong_source, rows), "funding source sha256 mismatch"))
+    wrong_snapshot = dict(good, modeled_mark_snapshot_sha256="0" * 64)
+    check("a wrong modeled mark snapshot sha256 holds",
+          raised(lambda: load_fixture_funding(wrong_snapshot, rows), "modeled mark snapshot sha256 mismatch"))
+    tampered_mark = Path(good["source_ref"]).parents[2] / "mark" / FUNDING_SYMBOL / "1h"
+    with gzip.open(tampered_mark / "BTCUSDT-1h-2025-05.jsonl.gz", "wt", encoding="utf-8") as handle:
+        handle.write(json.dumps({"open_time_ms": boundary, "open": "124.0", "close": "124.0"}) + "\n")
+    check("a mark file whose bytes changed holds, even with the declared digest",
+          raised(lambda: load_fixture_funding(good, rows), "modeled mark snapshot sha256 mismatch"))
+    check("an unreadable mark file also holds rather than being skipped",
+          (tampered_mark / "BTCUSDT-1h-2025-05.jsonl.gz").write_bytes(b"not gzip\n")
+          and raised(lambda: load_fixture_funding(good, rows), "not readable"))
+
+
+def test_j_duplicate_bad_status_and_malformed_rate_hold():
+    """Every structurally broken source is a HOLD, never a silent zero."""
+    root = Path(tempfile.mkdtemp(prefix="research-cell-funding-j-"))
+    rows = flat_cycle_rows()
+    duplicate = write_funding_fixture(
+        root / "dup", [official_event(funding_boundary(2)), official_event(funding_boundary(2))])
+    check("a duplicate funding timestamp holds",
+          raised(lambda: load_fixture_funding(duplicate, rows), "duplicate funding timestamp"))
+    same_hour = write_funding_fixture(
+        root / "hour", [official_event(funding_boundary(2)), official_event(funding_boundary(2) + 6)])
+    check("two events in one UTC hour hold instead of double-charging a boundary",
+          raised(lambda: load_fixture_funding(same_hour, rows), "share the UTC hour boundary"))
+    bad_status = write_funding_fixture(
+        root / "status", [official_event(funding_boundary(2), truth_status="estimated")])
+    check("an unregistered truth_status holds",
+          raised(lambda: load_fixture_funding(bad_status, rows), "truth_status"))
+    bad_rate = write_funding_fixture(root / "rate", [official_event(funding_boundary(2), "abc")])
+    check("a non-numeric funding rate holds",
+          raised(lambda: load_fixture_funding(bad_rate, rows), "funding_rate"))
+    infinite = write_funding_fixture(root / "inf", [official_event(funding_boundary(2), "inf")])
+    check("a non-finite funding rate holds",
+          raised(lambda: load_fixture_funding(infinite, rows), "not finite"))
+    bad_mark = write_funding_fixture(root / "mark", [official_event(funding_boundary(2), mark="-1")])
+    check("a non-positive official mark holds",
+          raised(lambda: load_fixture_funding(bad_mark, rows), "not positive"))
+    bad_stamp = write_funding_fixture(root / "stamp", [official_event(str(funding_boundary(2)))])
+    check("a non-integer funding timestamp holds",
+          raised(lambda: load_fixture_funding(bad_stamp, rows), "integer funding_time_ms"))
+    other_symbol = write_funding_fixture(
+        root / "symbol", [official_event(funding_boundary(2))], symbol="ETHUSDT")
+    check("a source for another symbol holds",
+          raised(lambda: load_fixture_funding(other_symbol, rows, symbol="BTCUSDT"), "does not match the cell symbol"))
+    unreadable = {
+        "basis": cell.FUNDING_BASIS,
+        "source_ref": str(root / "absent" / "funding" / FUNDING_SYMBOL / "BTCUSDT-funding.jsonl.gz"),
+        "source_sha256": "1" * 64,
+        "truth_status": list(cell.FUNDING_TRUTH_STATUS),
+        "modeled_mark_basis": cell.FUNDING_MODELED_MARK_BASIS,
+        "modeled_mark_snapshot_sha256": "2" * 64,
+    }
+    check("a missing funding source holds", raised(lambda: load_fixture_funding(unreadable, rows), "not readable"))
+    for label, broken in (
+        ("missing key", {key: value for key, value in unreadable.items() if key != "source_sha256"}),
+        ("wrong basis", dict(unreadable, basis="binance-spot-funding")),
+        ("wrong modeled mark basis", dict(unreadable, modeled_mark_basis="mark-close")),
+        ("wrong truth status set", dict(unreadable, truth_status=["official"])),
+        ("relative source path", dict(unreadable, source_ref="funding/BTCUSDT/BTCUSDT-funding.jsonl.gz")),
+    ):
+        check("a malformed funding identity holds: " + label,
+              raised(lambda broken=broken: load_fixture_funding(broken, rows), "funding identity is not usable"))
+
+
+def test_k_a_zero_trade_run_still_has_zero_funding_and_valid_evidence():
+    """Nothing was held, so nothing is charged, and the evidence says exactly that."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-k-"))
+    rows = transition_rows([100.0, 101.0, 100.0])
+    identity = write_funding_fixture(
+        tmp, [official_event(funding_boundary(0)), official_event(funding_boundary(1))])
+    funding = load_fixture_funding(identity, rows)
+    check("the series still carries its in-window events", len(funding["events"]) == 2, funding["events"])
+    run = replay(rows, funding=funding)
+    check("a flat window replays no cycle", run["records"] == [], run["records"])
+    check("a zero-trade run charges zero funding", run["funding_paid_quote"] == 0.0, run["funding_paid_quote"])
+    check("zero-trade metrics report a zero funding total rather than omitting it",
+          run["metrics"]["funding_paid_quote"] == 0.0, run["metrics"].get("funding_paid_quote"))
+    initial = float(run["overlay"]["initial_capital_quote"])
+    check("a zero-trade run still reconciles",
+          cell.funding_reconciles(run["records"], run["metrics"], initial, run["funding_paid_quote"]))
+    out = tmp / "evidence"
+    cell.write_evidence(out, {"symbol": FUNDING_SYMBOL}, rows, run["records"],
+                        [row["datetime"] for row in rows], run["projection"], run["metrics"])
+    check("the funding evidence is written even with nothing charged",
+          (out / "funding_events.csv").is_file())
+    lines = (out / "funding_events.csv").read_text(encoding="utf-8").splitlines()
+    check("a zero-charge run writes the funding header and no invented row", len(lines) == 1, lines)
+    check("the header still names every required funding column",
+          lines[0].split(",") == cell.funding_event_fieldnames(), lines[0])
+    approved = cell_config()
+    approved["research_cost_model"]["approved"] = True
+    approved["research_cost_model"]["funding"] = dict(funding["identity"])
+    applied = funding_applied_for(run, initial)
+    check("a zero-trade run can never claim performance, however clean its funding",
+          cell.performance_claimable(approved, run["metrics"], applied) is False)
+
+
+def test_l_end_equity_reconciles_and_the_first_bar_baseline_survives_funding():
+    """Net profit, funding and end equity must agree, first-bar baseline included."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-l-"))
+    rows = transition_rows([100.0, 100.0, 103.0, 106.0, 104.0, 104.0, 200.0, 205.0, 212.0, 210.0, 209.0, 209.0],
+                           entries={0, 6}, exits={4, 10})
+    identity = write_funding_fixture(
+        tmp, [official_event(funding_boundary(2)), official_event(funding_boundary(7))])
+    run = replay(rows, funding=load_fixture_funding(identity, rows))
+    initial = float(run["overlay"]["initial_capital_quote"])
+    records, metrics = run["records"], run["metrics"]
+    check("both cycles are replayed", len(records) == 2, len(records))
+    dca_total = float(sum(record["dca_net_pnl_quote"] for record in records))
+    funding_total = float(sum(record["funding_paid_quote"] for record in records))
+    check("each cycle paid exactly its own events",
+          all(abs(record["funding_paid_quote"] - sum(charge["payment_quote"] for charge in record["funding_events"])) < 1e-12
+              for record in records), [record["funding_paid_quote"] for record in records])
+    check("net profit is the fee result minus the funding",
+          abs(metrics["net_profit_usdt"] - (dca_total - funding_total)) < 1e-9,
+          (metrics["net_profit_usdt"], dca_total, funding_total))
+    check("net profit is the sum of realized cycle net PnL",
+          abs(metrics["net_profit_usdt"] - sum(record["realized_pnl_quote"] for record in records)) < 1e-12,
+          metrics["net_profit_usdt"])
+    check("end equity is initial capital plus net profit, funding included",
+          abs(metrics["end_equity_quote"] - (initial + metrics["net_profit_usdt"])) < 1e-9,
+          (metrics["end_equity_quote"], initial + metrics["net_profit_usdt"]))
+    check("the equity evidence closes on the same end equity",
+          abs(float(run["projection"][-1]["equity_quote"]) - metrics["end_equity_quote"]) < 1e-9,
+          (run["projection"][-1]["equity_quote"], metrics["end_equity_quote"]))
+    check("the reported funding total is the sum of the charges",
+          abs(metrics["funding_paid_quote"] - funding_total) < 1e-12,
+          (metrics["funding_paid_quote"], funding_total))
+    check("the first bar return is still measured from frozen initial capital",
+          abs(run["projection"][0]["bar_return"]
+              - (run["projection"][0]["equity_quote"] - initial) / initial) < 1e-12,
+          run["projection"][0])
+    check("the first bar carries the entry fee and can carry no funding",
+          run["projection"][0]["funding_paid_quote"] == 0.0, run["projection"][0])
+    check("the cumulative funding column is monotone and ends on the total",
+          [bar["funding_paid_quote"] for bar in run["projection"]][-1] == funding_total
+          and all(a <= b + 1e-12 for a, b in zip([bar["funding_paid_quote"] for bar in run["projection"]],
+                                                 [bar["funding_paid_quote"] for bar in run["projection"]][1:])),
+          [bar["funding_paid_quote"] for bar in run["projection"]])
+    check("the whole run reconciles", cell.funding_reconciles(records, metrics, initial, funding_total))
+    check("a broken identity still fails to reconcile",
+          cell.funding_reconciles([dict(records[0], funding_paid_quote=records[0]["funding_paid_quote"] + 1.0)]
+                                  + records[1:], metrics, initial, funding_total) is False)
+
+
+def test_l2_funding_boundaries_never_depend_on_the_host_timezone():
+    """A naive-UTC row must not be re-read as host-local: TZ cannot move a payment."""
+    import os
+    import time as clock
+
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-l2-"))
+    rows = flat_cycle_rows()
+    identity = write_funding_fixture(tmp, [official_event(funding_boundary(2))])
+    payments, indexes = [], []
+    original = os.environ.get("TZ")
+    try:
+        for zone in ("UTC", "Asia/Taipei", "America/New_York"):
+            os.environ["TZ"] = zone
+            clock.tzset()
+            run = replay(rows, funding=load_fixture_funding(identity, rows))
+            payments.append(round(run["records"][0]["funding_paid_quote"], 12))
+            indexes.append(run["records"][0]["funding_events"][0]["charge_index"])
+    finally:
+        if original is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original
+        clock.tzset()
+    check("the same series charges the same payment in every host timezone", len(set(payments)) == 1, payments)
+    check("the charge lands on the same bar in every host timezone", len(set(indexes)) == 1, indexes)
+    check("and the payment is the exact hand-computed amount", payments[0] == 1.8, payments)
+
+
+def test_m_performance_claimable_requires_a_verified_applied_funding_model():
+    """The claim opens only for an approved model the runtime itself re-verified."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-funding-m-"))
+    rows = flat_cycle_rows()
+    identity = write_funding_fixture(tmp, [official_event(funding_boundary(2))])
+    funding = load_fixture_funding(identity, rows)
+    run = replay(rows, funding=funding)
+    initial = float(run["overlay"]["initial_capital_quote"])
+    applied = funding_applied_for(run, initial)
+    cfg = cell_config()
+    cfg["research_cost_model"]["approved"] = True
+    cfg["research_cost_model"]["funding"] = dict(funding["identity"])
+    check("an approved, fully verified model makes the config runnable",
+          cell.problems_in_config(cfg) == [], cell.problems_in_config(cfg))
+    check("the applied economics match the declared model", cell.applied_cost_matches_model(cfg, applied)[0] is True,
+          cell.applied_cost_matches_model(cfg, applied))
+    check("the match reason names fees and the funding events",
+          "funding event" in cell.applied_cost_matches_model(cfg, applied)[1],
+          cell.applied_cost_matches_model(cfg, applied)[1])
+    check("a verified model with a real trade and defined metrics IS claimable",
+          cell.performance_claimable(cfg, run["metrics"], applied) is True,
+          (run["metrics"]["total_trades"], run["metrics"]["cagr_pct"], run["metrics"]["sharpe"]))
+    for label, mutate in (
+        ("unapproved cost model", lambda c, a: c["research_cost_model"].update(approved=False)),
+        ("declared slippage", lambda c, a: c["research_cost_model"].update(slippage=0.0002)),
+        ("fee mismatch", lambda c, a: c["research_cost_model"].update(fees_per_side=0.0002)),
+        ("legacy not_modeled funding", lambda c, a: c["research_cost_model"].update(funding="not_modeled")),
+        ("malformed declared identity", lambda c, a: c["research_cost_model"]["funding"].pop("source_sha256")),
+        ("wrong declared source sha", lambda c, a: c["research_cost_model"]["funding"].update(source_sha256="0" * 64)),
+        ("wrong declared snapshot sha",
+         lambda c, a: c["research_cost_model"]["funding"].update(modeled_mark_snapshot_sha256="0" * 64)),
+        ("funding reported as not applied", lambda c, a: a.update(funding_applied=False)),
+        ("funding reported as not reconciled", lambda c, a: a.update(reconciled=False)),
+        ("no applied evidence at all", lambda c, a: a.clear()),
+        ("runtime identity missing", lambda c, a: a.update(identity=None)),
+        ("runtime identity for another source", lambda c, a: a.update(identity=dict(a["identity"], source_sha256="0" * 64))),
+    ):
+        broken_cfg, broken_applied = cell_config(), dict(applied)
+        broken_cfg["research_cost_model"]["approved"] = True
+        broken_cfg["research_cost_model"]["funding"] = dict(funding["identity"])
+        broken_applied["identity"] = dict(applied["identity"])
+        broken_cfg["research_cost_model"]["funding"] = dict(funding["identity"])
+        mutate(broken_cfg, broken_applied)
+        check("claim stays false: " + label,
+              cell.performance_claimable(broken_cfg, run["metrics"], broken_applied) is False,
+              cell.applied_cost_matches_model(broken_cfg, broken_applied))
+    check("claim stays false with no trade",
+          cell.performance_claimable(cfg, dict(run["metrics"], total_trades=0), applied) is False)
+    check("claim stays false with an undefined CAGR",
+          cell.performance_claimable(cfg, dict(run["metrics"], cagr_pct=None), applied) is False)
+    check("claim stays false with an undefined Sharpe",
+          cell.performance_claimable(cfg, dict(run["metrics"], sharpe=None), applied) is False)
+    legacy = cell_config()
+    legacy["research_cost_model"]["approved"] = True
+    legacy_run = replay(rows)
+    check("a legacy not_modeled run is valid evidence but never claimable",
+          cell.performance_claimable(legacy, legacy_run["metrics"],
+                                     funding_applied_for(legacy_run, initial)) is False,
+          cell.applied_cost_matches_model(legacy, funding_applied_for(legacy_run, initial)))
 
 
 def main():

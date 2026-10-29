@@ -16,7 +16,18 @@ local fixture:
 - research_leverage scales the house quote exposure and the realized ledger by
   exactly 5/3 from 3x to 5x, reproducibly, through the exported
   Qlib <-> Hummingbot DCA path;
-- the BO + 2 SO stage semantics of that path are not broken.
+- the BO + 2 SO stage semantics of that path are not broken;
+- a materialized cell replays the artifact's whole long-only transition series:
+  every entry/exit pair becomes one house DCA cycle, the strategy exit is a real
+  close boundary, an early overlay exit never invents a new source entry, and an
+  impossible transition sequence fails closed;
+- one fee-inclusive account equity series spans the fixed evaluation window with
+  flat bars included, and its final value is initial capital plus net profit;
+- cagr/sharpe/max drawdown/win rate/profit factor follow their persisted
+  definitions exactly, including the zero-trade and zero-volatility cases;
+- an approved research cost model only claims performance when the applied
+  economics are mechanically equivalent to it;
+- the evidence files and the manifest cover every one of those bars and cycles.
 
 No Qlib provider, no campaign run, no network. The DCA module, the cell module
 and the strategy artifacts are loaded by path so the math is testable in any
@@ -708,6 +719,459 @@ def test_3x_vs_5x_exposure_pnl_and_reproducibility():
           and kind_3a == kind_3b)
     check("leverage is not modeled as fees or funding",
           float(ledger_3a["cum_fees_quote"].iloc[-1]) > 0.0)
+
+
+
+# ------------------------------------------------- full-strategy replay tests
+
+
+def replay_overlay():
+    """Return the house overlay exactly as a materialized cell config carries it.
+
+    A hand-shaped dict is what let a wrong overlay key slip through before, so the
+    replay fixtures read the canonical config block instead of restating it.
+    """
+    return cell_config()["house_overlay"]
+
+
+def transition_rows(closes, entries=(), exits=(), start=None):
+    """Build artifact rows around an explicit close path plus its transitions."""
+    start = start or datetime(2025, 5, 1)
+    return [
+        {
+            "datetime": start + timedelta(hours=index),
+            "high": float(close) * 1.001,
+            "low": float(close) * 0.999,
+            "close": float(close),
+            "entry_transition": int(index in entries),
+            "exit_transition": int(index in exits),
+        }
+        for index, close in enumerate(closes)
+    ]
+
+
+def replay(rows, first=None, last=None, overlay=None, leverage=3, simulator=None):
+    """Plan, replay and project one synthetic transition series end to end."""
+    overlay = overlay or replay_overlay()
+    first = 0 if first is None else first
+    last = len(rows) - 1 if last is None else last
+    cycles, skipped = cell.plan_cycles(rows, first, last)
+    records = cell.replay_cycles(rows, cycles, overlay, leverage,
+                                 simulator=simulator or dca.simulate_hummingbot_dca)
+    indices = list(range(first, last + 1))
+    projection = cell.equity_projection(indices, records, float(overlay["initial_capital_quote"]))
+    metrics = cell.metrics_from_equity(
+        [rows[index]["datetime"] for index in indices],
+        [bar["equity_quote"] for bar in projection],
+        [record["realized_pnl_quote"] for record in records],
+        cell.PERIODS_PER_YEAR["1h"],
+    )
+    return {"cycles": cycles, "skipped": skipped, "records": records, "projection": projection,
+            "metrics": metrics, "indices": indices, "overlay": overlay}
+
+
+def two_cycle_series():
+    """Two take-profit cycles on two different entry prices, with flat gaps."""
+    return replay(transition_rows(
+        [100.0, 100.0, 103.0, 106.0, 104.0, 104.0, 200.0, 205.0, 212.0, 210.0, 209.0, 209.0],
+        entries={1, 6}, exits={4, 10},
+    ))
+
+
+def test_replay_uses_the_frozen_config_overlay_keys():
+    """The replay must read the canonical overlay keys a real cell config carries."""
+    overlay = replay_overlay()
+    check("the replay fixture is the config-shaped overlay, not a hand-shaped dict",
+          set(overlay) == set(cell.OVERLAY_KEYS), sorted(overlay))
+    check("the safety-order allocation key is the canonical one",
+          "safety_order_quote_pct" in overlay and "safety_order_pct" not in overlay, sorted(overlay))
+    run = replay(transition_rows([100.0, 100.0, 103.0, 106.0, 104.0], entries={1}, exits={4}), overlay=overlay)
+    record = run["records"][0]
+    check("replaying through the canonical overlay keys produces the stage plan",
+          record["stage_quote_amounts"] == [18000.0, 18000.0, 18000.0], record["stage_quote_amounts"])
+    check("and realizes the cycle without a KeyError",
+          abs(record["realized_pnl_quote"] - 1065.6) < 1e-9, record["realized_pnl_quote"])
+    wrong = dict(overlay)
+    wrong["safety_order_pct"] = wrong.pop("safety_order_quote_pct")
+    failed = None
+    try:
+        replay(transition_rows([100.0, 100.0, 103.0], entries={1}), overlay=wrong)
+    except KeyError as exc:
+        failed = str(exc)
+    check("a wrong overlay key is a hard failure, never a silent default",
+          failed is not None and "safety_order_quote_pct" in failed, failed)
+
+
+def test_cost_model_equivalence_gates_performance_claimable():
+    """An approved cost declaration alone must not make metrics claimable."""
+    frozen = cell_config()
+    matches, reason = cell.applied_cost_matches_model(frozen)
+    check("the frozen canonical cost model is not approved", matches is False and "not approved" in reason,
+          reason)
+    check("the replay applies no funding, so net performance cannot be claimed",
+          cell.FUNDING_APPLIED_TO_PNL is False, cell.FUNDING_APPLIED_TO_PNL)
+    approved = cell_config()
+    approved["research_cost_model"]["approved"] = True
+    matches, reason = cell.applied_cost_matches_model(approved)
+    check("an approved fee-only model still fails on unmodeled funding", matches is False, matches)
+    check("the reason names funding as the gap", "funding" in reason.lower(), reason)
+    check("approved + fees match + slippage 0 + funding not_modeled is NOT claimable",
+          cell.performance_claimable(approved, two_cycle_series()["metrics"]) is False)
+    for label, mutate in (
+        ("declared slippage is not applied", lambda cost: cost.update(slippage=0.0002)),
+        ("declared funding is not applied", lambda cost: cost.update(funding="8h")),
+        ("declared fee is not the fee the overlay applies", lambda cost: cost.update(fees_per_side=0.0002)),
+        ("funding declared as not modeled", lambda cost: cost.update(funding="not_modeled")),
+    ):
+        broken = cell_config()
+        broken["research_cost_model"]["approved"] = True
+        mutate(broken["research_cost_model"])
+        check("fail closed: " + label, cell.applied_cost_matches_model(broken)[0] is False,
+              cell.applied_cost_matches_model(broken))
+    traded = two_cycle_series()["metrics"]
+    check("the frozen cost model keeps good evidence unclaimable",
+          cell.performance_claimable(frozen, traded) is False)
+    check("no trade keeps the claim false",
+          cell.performance_claimable(approved, replay(transition_rows([100.0, 101.0]))["metrics"]) is False)
+    check("undefined metrics keep the claim false",
+          cell.performance_claimable(approved, dict(traded, cagr_pct=None)) is False)
+    check("a malformed cost block keeps the claim false",
+          cell.performance_claimable({"research_cost_model": "approved", "house_overlay": {}}, traded) is False)
+
+
+def test_two_complete_cycles_are_both_replayed():
+    """Every entry/exit pair in the window is replayed, not just the first."""
+    run = two_cycle_series()
+    records = run["records"]
+    check("two entry/exit pairs produce two cycles", len(records) == 2, records)
+    check("no cycle is skipped inside the window", run["skipped"] == 0, run["skipped"])
+    first, second = records[0], records[1]
+    check("cycle 1 opens on its own entry bar", (first["entry_index"], first["exit_index"]) == (1, 4),
+          (first["entry_index"], first["exit_index"]))
+    check("cycle 2 opens on the second entry bar", (second["entry_index"], second["exit_index"]) == (6, 10),
+          (second["entry_index"], second["exit_index"]))
+    check("each cycle prices its stage from its own entry close",
+          first["stage_prices"] == [100.0, 96.0, 92.0] and second["stage_prices"] == [200.0, 192.0, 184.0],
+          (first["stage_prices"], second["stage_prices"]))
+    check("both cycles close on their overlay take profit",
+          [record["close_reason"] for record in records] == ["TAKE_PROFIT", "TAKE_PROFIT"],
+          [record["close_reason"] for record in records])
+    check("both cycles realize their own fee-inclusive PnL",
+          all(abs(record["realized_pnl_quote"] - 1065.6) < 1e-9 for record in records),
+          [record["realized_pnl_quote"] for record in records])
+    check("the aggregate PnL is the sum of the replayed cycles",
+          abs(run["metrics"]["net_profit_usdt"] - 2131.2) < 1e-9, run["metrics"]["net_profit_usdt"])
+    check("both cycles count as trades", run["metrics"]["total_trades"] == 2, run["metrics"]["total_trades"])
+    positions = [bar["position_state"] for bar in run["projection"]]
+    check("each cycle is long while the overlay holds, source_long after it closes, flat after the exit",
+          positions == ["flat", "long", "long", "long", "source_long", "flat",
+                        "long", "long", "long", "source_long", "source_long", "flat"], positions)
+    check("the overlay's doubled last-bar allocation is not equity",
+          abs(records[0]["max_exposure_quote"] - 2 * 18000.0) < 1e-9, records[0]["max_exposure_quote"])
+
+
+def test_entry_ts_is_evidence_only_and_every_transition_is_replayed():
+    """The committed artifact's entry_ts is its LAST entry; the rows must drive replay."""
+    closes = []
+    price = 100.0
+    for _ in range(6):
+        for _ in range(8):
+            price += 2.0
+            closes.append(round(price, 4))
+        for _ in range(8):
+            price -= 3.0
+            closes.append(round(price, 4))
+    start = datetime(2025, 5, 1)
+    times = [start + timedelta(hours=index) for index in range(len(closes))]
+    series = {
+        "high": [value * 1.004 for value in closes],
+        "low": [value * 0.996 for value in closes],
+        "close": closes,
+        "volume": [1000.0 for _ in closes],
+        "times": times,
+        "window_start": times[10],
+        "window_end": times[-1],
+    }
+    directory, path = write_strategy_dir(
+        Path(tempfile.mkdtemp(prefix="research-cell-abi-")), "strategy_signal.py",
+        DONCHIAN_PATH.read_text(encoding="utf-8"))
+    function = cell.load_signal_artifact(directory, artifact(path))
+    rows, entry_ts = function(
+        high=series["high"], low=series["low"], close=series["close"], volume=series["volume"],
+        times=series["times"], params={"entry_len": 5, "exit_len": 3},
+        window_start=series["window_start"], window_end=series["window_end"],
+    )
+    entries = [row["datetime"] for row in rows if row["entry_transition"] == 1]
+    check("the committed fixture produces several entry transitions", len(entries) > 2, entries)
+    check("its single entry_ts is the last transition, not the first",
+          entry_ts == entries[-1] and entry_ts != entries[0], (entry_ts, entries[0], entries[-1]))
+    fast = replay(rows, first=10)
+    check("the replay still uses every transition row",
+          len(fast["records"]) == len(entries), (len(fast["records"]), len(entries)))
+    check("each replayed cycle starts on its own entry bar",
+          [record["entry_index"] for record in fast["records"]]
+          == [index for index, row in enumerate(rows) if row["entry_transition"] == 1],
+          [record["entry_index"] for record in fast["records"]])
+    check("the metrics count every cycle, not the single entry_ts",
+          fast["metrics"]["total_trades"] == len(entries), fast["metrics"]["total_trades"])
+
+
+def test_strategy_exit_closes_the_cycle_without_an_overlay_exit():
+    """A source exit is a real close boundary even when the overlay never fired."""
+    run = replay(transition_rows([100.0, 100.0, 100.5, 101.0], entries={1}, exits={3}))
+    record = run["records"][0]
+    check("the strategy exit closes at the exit bar",
+          (record["exit_index"], record["close_index"]) == (3, 3), (record["exit_index"], record["close_index"]))
+    check("the close reason is the strategy exit, not an invented overlay exit",
+          record["close_reason"] == "STRATEGY_EXIT", record["close_reason"])
+    check("the primitive's own boundary close type is preserved for audit",
+          record["dca_close_type"] in ("TIME_LIMIT", "FAILED"), record["dca_close_type"])
+    check("the cycle realizes the mark to market at the exit bar",
+          abs(record["realized_pnl_quote"] - 165.6) < 1e-9, record["realized_pnl_quote"])
+    check("one cycle is reported", run["metrics"]["total_trades"] == 1, run["metrics"]["total_trades"])
+
+
+def test_overlay_exit_before_the_source_exit_creates_no_phantom_entry():
+    """TP before the source exit leaves the account flat but the source long."""
+    run = replay(transition_rows([100.0, 100.0, 103.0, 106.0, 104.0, 103.0, 104.0, 104.0, 104.0],
+                                 entries={1, 7}, exits={6}))
+    records = run["records"]
+    check("the early overlay exit and the later source exit are two cycles, not three",
+          len(records) == 2, [record["entry_index"] for record in records])
+    first, second = records[0], records[1]
+    check("cycle 1 closes on take profit before its source exit",
+          (first["close_index"], first["exit_index"], first["close_reason"]) == (3, 6, "TAKE_PROFIT"),
+          (first["close_index"], first["exit_index"], first["close_reason"]))
+    check("the account stays flat while the source is still long",
+          [bar["position_state"] for bar in run["projection"][3:7]]
+          == ["long", "source_long", "source_long", "source_long"],
+          [bar["position_state"] for bar in run["projection"][3:7]])
+    check("equity is carried, not re-marked, while the overlay is flat",
+          len({round(run["projection"][index]["equity_quote"], 9) for index in (3, 4, 5, 6)}) == 1,
+          [run["projection"][index]["equity_quote"] for index in (3, 4, 5, 6)])
+    check("no phantom cycle starts inside the still-long source state",
+          second["entry_index"] == 7, second["entry_index"])
+    check("the cycle still open at window end is forced flat there",
+          second["close_reason"] == "FORCE_FLAT" and second["forced"] is True, second["close_reason"])
+    check("a forced flat on a single bar pays only the round-trip cost",
+          abs(second["realized_pnl_quote"] + 14.4) < 1e-9, second["realized_pnl_quote"])
+
+
+def test_full_equity_covers_flat_bars_and_reconciles():
+    """equity.csv spans the whole window and final equity == initial + net profit."""
+    run = two_cycle_series()
+    projection, metrics = run["projection"], run["metrics"]
+    initial = float(run["overlay"]["initial_capital_quote"])
+    check("every evaluation bar carries an equity point", len(projection) == 12, len(projection))
+    check("a flat bar before the first cycle is present and unchanged",
+          projection[0]["position_state"] == "flat" and projection[0]["equity_quote"] == initial
+          and projection[0]["bar_return"] == 0.0, projection[0])
+    check("flat bars between cycles carry the realized PnL",
+          projection[5]["position_state"] == "flat" and abs(projection[5]["equity_quote"] - 101065.6) < 1e-9,
+          projection[5])
+    check("flat bars have zero bar return",
+          all(projection[index]["bar_return"] == 0.0 for index in (0, 4, 5, 9, 10, 11)),
+          [projection[index]["bar_return"] for index in (0, 4, 5, 9, 10, 11)])
+    check("the entry bar carries the round-trip cost immediately",
+          abs(projection[1]["equity_quote"] - (initial - 14.4)) < 1e-9, projection[1])
+    check("final equity equals initial capital plus net profit",
+          abs(metrics["end_equity_quote"] - (initial + metrics["net_profit_usdt"])) < 1e-9,
+          (metrics["end_equity_quote"], initial + metrics["net_profit_usdt"]))
+    check("the equity series ends on the last evaluation bar",
+          abs(metrics["end_equity_quote"] - 102131.2) < 1e-9, metrics["end_equity_quote"])
+    check("the fee model is documented as the frozen primitive's round-trip estimate",
+          "2 * house_overlay.trade_cost" in metrics["definitions"]["fee_model"],
+          metrics["definitions"]["fee_model"])
+
+
+def test_cagr_sharpe_drawdown_win_rate_and_profit_factor_formulas():
+    """The reported metrics match their persisted definitions, exactly."""
+    import statistics
+
+    equity = [100.0, 120.0, 90.0, 100.0]
+    stamps = [datetime(2025, 1, 1) + timedelta(days=index) for index in range(4)]
+    realized = [10.0, -5.0, 20.0]
+    metrics = cell.metrics_from_equity(stamps, equity, realized, cell.PERIODS_PER_YEAR["1h"])
+    returns = [0.0, 0.2, -0.25, 100.0 / 90.0 - 1.0]
+    expected_sharpe = statistics.mean(returns) / statistics.stdev(returns) * (8760 ** 0.5)
+    check("net return is measured on fee-inclusive equity", metrics["net_return_pct"] == 0.0,
+          metrics["net_return_pct"])
+    check("sharpe is mean/stdev(ddof=1) annualized by the frozen periods per year",
+          abs(metrics["sharpe"] - expected_sharpe) < 1e-12, (metrics["sharpe"], expected_sharpe))
+    check("the persisted sharpe definition states ddof and the zero-variance rule",
+          "ddof=1" in metrics["definitions"]["sharpe"] and "stdev is zero" in metrics["definitions"]["sharpe"],
+          metrics["definitions"]["sharpe"])
+    check("max drawdown is peak to trough on equity", abs(metrics["max_drawdown_pct"] - 25.0) < 1e-12,
+          metrics["max_drawdown_pct"])
+    check("the max drawdown definition is persisted as its own key",
+          metrics["max_drawdown_definition"] == metrics["definitions"]["max_drawdown_pct"])
+    check("win rate counts only positive completed cycles",
+          abs(metrics["win_rate_pct"] - (200.0 / 3.0)) < 1e-12, metrics["win_rate_pct"])
+    check("profit factor is gross profit over absolute gross loss", metrics["profit_factor"] == 6.0,
+          metrics["profit_factor"])
+    check("trade count is the number of replayed cycles", metrics["total_trades"] == 3,
+          metrics["total_trades"])
+    check("net profit is the sum of realized cycle PnL", metrics["net_profit_usdt"] == 25.0,
+          metrics["net_profit_usdt"])
+    annual = [datetime(2025, 1, 1), datetime(2026, 1, 1)]
+    one_year = cell.metrics_from_equity(annual, [100.0, 110.0], [10.0], cell.PERIODS_PER_YEAR["1d"])
+    check("cagr is geometric over the actual elapsed year",
+          abs(one_year["cagr_pct"] - 10.0) < 1e-9, one_year["cagr_pct"])
+    half = cell.metrics_from_equity([annual[0], datetime(2025, 7, 2)], [100.0, 110.0], [10.0],
+                                    cell.PERIODS_PER_YEAR["1d"])
+    check("cagr compounds the actual elapsed time instead of reusing the return",
+          half["cagr_pct"] > 19.0 and abs(half["net_return_pct"] - 10.0) < 1e-9,
+          (half["cagr_pct"], half["net_return_pct"]))
+    no_loss = cell.metrics_from_equity(stamps, equity, [5.0, 3.0], cell.PERIODS_PER_YEAR["1h"])
+    check("profit factor is null when no cycle lost money", no_loss["profit_factor"] is None,
+          no_loss["profit_factor"])
+    empty = cell.metrics_from_equity(stamps, equity, [], cell.PERIODS_PER_YEAR["4h"])
+    check("profit factor and win rate are null with no cycle",
+          empty["profit_factor"] is None and empty["win_rate_pct"] is None
+          and empty["total_trades"] == 0, (empty["profit_factor"], empty["win_rate_pct"]))
+    four_hour = cell.metrics_from_equity(stamps, equity, realized, cell.PERIODS_PER_YEAR["4h"])
+    check("annualization follows the frozen timeframe periods per year",
+          abs(four_hour["sharpe"] / metrics["sharpe"] - (2190 / 8760) ** 0.5) < 1e-12,
+          (four_hour["sharpe"], metrics["sharpe"]))
+
+
+def test_zero_trade_and_zero_volatility_evidence():
+    """A window with no cycle is complete evidence, never fabricated performance."""
+    run = replay(transition_rows([100.0, 101.0, 99.0, 100.0]))
+    metrics = run["metrics"]
+    check("a flat window replays no cycle", run["records"] == [] and metrics["total_trades"] == 0,
+          metrics["total_trades"])
+    check("every bar still carries the initial equity",
+          {bar["equity_quote"] for bar in run["projection"]} == {100000.0}
+          and {bar["position_state"] for bar in run["projection"]} == {"flat"},
+          {bar["equity_quote"] for bar in run["projection"]})
+    check("zero-trade metrics use the explicit deterministic representation",
+          (metrics["net_return_pct"], metrics["cagr_pct"], metrics["net_profit_usdt"],
+           metrics["max_drawdown_pct"]) == (0.0, 0.0, 0.0, 0.0),
+          (metrics["net_return_pct"], metrics["cagr_pct"], metrics["net_profit_usdt"]))
+    check("undefined metrics stay null instead of being invented",
+          metrics["sharpe"] is None and metrics["profit_factor"] is None
+          and metrics["win_rate_pct"] is None,
+          (metrics["sharpe"], metrics["profit_factor"], metrics["win_rate_pct"]))
+    approved = cell_config()
+    approved["research_cost_model"]["approved"] = True
+    check("an approved cost model cannot claim performance without a trade",
+          cell.performance_claimable(approved, metrics) is False)
+    flat = cell.metrics_from_equity([datetime(2025, 1, 1), datetime(2025, 1, 2)], [100.0, 100.0], [],
+                                    cell.PERIODS_PER_YEAR["1h"])
+    check("zero volatility is null sharpe, not a division", flat["sharpe"] is None, flat["sharpe"])
+
+
+def test_malformed_transition_sequences_fail_closed():
+    """Impossible transition sequences hold instead of being guessed."""
+    rows = transition_rows([100.0, 100.0, 101.0, 102.0, 103.0, 104.0])
+    orphan_exit = [dict(row) for row in rows]
+    orphan_exit[2]["exit_transition"] = 1
+    check("an exit without an open cycle fails closed",
+          raised(lambda: cell.plan_cycles(orphan_exit, 0, 5), "without an open source cycle"))
+    doubled_entry = [dict(row) for row in rows]
+    doubled_entry[1]["entry_transition"] = 1
+    doubled_entry[3]["entry_transition"] = 1
+    check("an entry while the source is still long fails closed",
+          raised(lambda: cell.plan_cycles(doubled_entry, 0, 5), "while the source is still long"))
+    collision = [dict(row) for row in rows]
+    collision[1]["entry_transition"] = 1
+    collision[1]["exit_transition"] = 1
+    check("a bar carrying both transitions fails closed",
+          raised(lambda: cell.plan_cycles(collision, 0, 5), "both an entry and an exit"))
+    late_window = [dict(row) for row in rows]
+    late_window[1]["entry_transition"] = 1
+    late_window[4]["exit_transition"] = 1
+    check("a source long on the first evaluation bar fails closed",
+          raised(lambda: cell.plan_cycles(late_window, 3, 5), "long on the first evaluation bar"))
+    before_window = [dict(row) for row in rows]
+    before_window[0]["entry_transition"] = 1
+    before_window[1]["exit_transition"] = 1
+    cycles, skipped = cell.plan_cycles(before_window, 2, 5)
+    check("a cycle that completed before the window is skipped, not replayed",
+          cycles == [] and skipped == 1, (cycles, skipped))
+    open_cycle = [dict(row) for row in rows]
+    open_cycle[2]["entry_transition"] = 1
+    forced, skipped_open = cell.plan_cycles(open_cycle, 0, 5)
+    check("a cycle still open at the last bar is forced flat there",
+          len(forced) == 1 and forced[0]["forced"] is True and forced[0]["exit_index"] == 5, forced)
+    check("a forced cycle is not counted as a pre-window cycle", skipped_open == 0, skipped_open)
+    check("the fail-closed message is a HOLD, not a silent default",
+          raised(lambda: cell.plan_cycles(orphan_exit, 0, 5), "HOLD:"))
+
+
+def test_evidence_files_and_manifest_cover_the_whole_window():
+    """write_evidence emits every required artifact and the manifest hashes them."""
+    import csv
+
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-evidence-"))
+    run = two_cycle_series()
+    rows = transition_rows(
+        [100.0, 100.0, 103.0, 106.0, 104.0, 104.0, 200.0, 205.0, 212.0, 210.0, 209.0, 209.0],
+        entries={1, 6}, exits={4, 10},
+    )
+    evaluation_times = [rows[index]["datetime"] for index in run["indices"]]
+    names = cell.write_evidence(tmp, {"symbol": "BTCUSDT", "cycles_replayed": 2}, rows, run["records"],
+                                evaluation_times, run["projection"], run["metrics"])
+    manifest = cell.write_manifest(tmp)
+    required = ["summary.json", "signals.csv", "trades.csv", "events.csv", "equity.csv", "metrics.json"]
+    check("every required evidence file is written",
+          all((tmp / name).is_file() for name in required), sorted(p.name for p in tmp.iterdir()))
+    check("write_evidence names exactly the non-MLflow evidence it wrote",
+          names == ["summary.json", "signals.csv", "trades.csv", "events.csv", "equity.csv", "metrics.json"],
+          names)
+    with (tmp / "equity.csv").open(newline="", encoding="utf-8") as handle:
+        equity_rows = list(csv.DictReader(handle))
+    check("equity.csv spans every evaluation bar", len(equity_rows) == 12, len(equity_rows))
+    check("equity.csv carries the minimum contract columns",
+          {"datetime", "equity_quote", "bar_return", "position_state", "cycle_number"}
+          <= set(equity_rows[0]), sorted(equity_rows[0]))
+    check("equity.csv final row equals initial plus net profit",
+          abs(float(equity_rows[-1]["equity_quote"]) - 102131.2) < 1e-9, equity_rows[-1]["equity_quote"])
+    with (tmp / "trades.csv").open(newline="", encoding="utf-8") as handle:
+        trades = list(csv.DictReader(handle))
+    check("trades.csv has one row per replayed cycle", len(trades) == 2, trades)
+    check("trades.csv carries entry/exit/close, close reason and stage fill facts",
+          {"entry_ts_utc", "exit_ts_utc", "close_ts_utc", "close_reason", "realized_pnl_quote",
+           "stage_0_filled_quote", "stage_2_filled_quote"} <= set(trades[0]), sorted(trades[0]))
+    check("an unfilled safety order is recorded as zero, not invented",
+          float(trades[0]["stage_2_filled_quote"]) == 0.0, trades[0]["stage_2_filled_quote"])
+    with (tmp / "events.csv").open(newline="", encoding="utf-8") as handle:
+        events = list(csv.DictReader(handle))
+    check("events.csv keeps one row per replayed stage, as the pinned transport counts",
+          len(events) == 2 * 3, len(events))
+    check("events.csv keeps the legacy stage columns and adds the cycle number",
+          list(events[0]) == ["cycle", "stage", "stage_price", "stage_quote_amount", "filled_quote"],
+          list(events[0]))
+    with (tmp / "signals.csv").open(newline="", encoding="utf-8") as handle:
+        signal_rows = list(csv.DictReader(handle))
+    check("signals.csv holds the artifact's window rows", len(signal_rows) == 12, len(signal_rows))
+    metrics_file = json.loads((tmp / "metrics.json").read_text(encoding="utf-8"))
+    required_metrics = ["net_return_pct", "cagr_pct", "sharpe", "max_drawdown_pct", "max_drawdown_definition",
+                        "win_rate_pct", "total_trades", "profit_factor", "net_profit_usdt"]
+    check("metrics.json exposes every required metric",
+          all(key in metrics_file for key in required_metrics),
+          [key for key in required_metrics if key not in metrics_file])
+    check("the manifest hashes every non-MLflow evidence file",
+          sorted(manifest) == sorted(names), (sorted(manifest), sorted(names)))
+    check("the manifest does not hash itself",
+          "manifest.json" not in manifest and "mlruns" not in json.dumps(manifest))
+    check("every manifest digest matches the file on disk",
+          all(hashlib.sha256((tmp / name).read_bytes()).hexdigest() == entry["sha256"]
+              for name, entry in manifest.items()))
+
+
+def test_zero_cycle_events_file_keeps_the_transport_shape():
+    """A zero-cycle cell writes the events header and invents no stage row."""
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-zero-events-"))
+    rows = transition_rows([100.0, 101.0, 100.0])
+    run = replay(rows)
+    cell.write_evidence(tmp, {"symbol": "BTCUSDT"}, rows, run["records"],
+                        [row["datetime"] for row in rows], run["projection"], run["metrics"])
+    lines = (tmp / "events.csv").read_text(encoding="utf-8").splitlines()
+    check("a zero-cycle run writes the events header but no invented stage row", len(lines) == 1, lines)
+    check("so the pinned transport's execution count cannot be satisfied by a no-trade cell",
+          len(lines) < 2 and run["records"] == [], (len(lines), run["records"]))
 
 
 def main():

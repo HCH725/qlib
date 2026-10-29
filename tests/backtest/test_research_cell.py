@@ -765,6 +765,7 @@ def replay(rows, first=None, last=None, overlay=None, leverage=3, simulator=None
         [bar["equity_quote"] for bar in projection],
         [record["realized_pnl_quote"] for record in records],
         cell.PERIODS_PER_YEAR["1h"],
+        float(overlay["initial_capital_quote"]),
     )
     return {"cycles": cycles, "skipped": skipped, "records": records, "projection": projection,
             "metrics": metrics, "indices": indices, "overlay": overlay}
@@ -984,6 +985,42 @@ def test_full_equity_covers_flat_bars_and_reconciles():
           metrics["definitions"]["fee_model"])
 
 
+def test_first_evaluation_bar_entry_cost_is_in_metrics_baseline():
+    """First-bar fees must reduce return/CAGR and count in drawdown from frozen capital."""
+    run = replay(
+        transition_rows([100.0, 100.0, 100.0], entries={0}, exits={2}),
+        first=0,
+        last=2,
+    )
+    metrics = run["metrics"]
+    projection = run["projection"]
+    initial = float(run["overlay"]["initial_capital_quote"])
+    fee_loss = run["records"][0]["realized_pnl_quote"]
+    check("the synthetic cycle loses only the frozen primitive round-trip fee",
+          abs(fee_loss + 14.4) < 1e-9, fee_loss)
+    check("the first observed equity already includes the first-bar fee",
+          abs(projection[0]["equity_quote"] - (initial - 14.4)) < 1e-9, projection[0])
+    check("the first bar return is measured from frozen initial capital",
+          abs(projection[0]["bar_return"] - (-14.4 / initial)) < 1e-12, projection[0]["bar_return"])
+    check("reported start remains frozen initial capital, not post-fee first observed equity",
+          metrics["start_equity_quote"] == initial
+          and metrics["first_observed_equity_quote"] == projection[0]["equity_quote"],
+          (metrics["start_equity_quote"], metrics["first_observed_equity_quote"]))
+    check("net return includes the first-bar fee",
+          abs(metrics["net_return_pct"] - (fee_loss / initial * 100.0)) < 1e-12,
+          metrics["net_return_pct"])
+    check("max drawdown includes the first-bar fee from the initial-capital peak",
+          abs(metrics["max_drawdown_pct"] - (-fee_loss / initial * 100.0)) < 1e-12,
+          metrics["max_drawdown_pct"])
+    check("CAGR is negative rather than falsely zero", metrics["cagr_pct"] is not None and metrics["cagr_pct"] < 0,
+          metrics["cagr_pct"])
+    check("Sharpe includes the negative first bar rather than becoming undefined",
+          metrics["sharpe"] is not None and metrics["sharpe"] < 0, metrics["sharpe"])
+    check("final equity reconciles with frozen initial capital plus realized PnL",
+          abs(metrics["end_equity_quote"] - (initial + metrics["net_profit_usdt"])) < 1e-9,
+          (metrics["end_equity_quote"], initial + metrics["net_profit_usdt"]))
+
+
 def test_cagr_sharpe_drawdown_win_rate_and_profit_factor_formulas():
     """The reported metrics match their persisted definitions, exactly."""
     import statistics
@@ -991,7 +1028,7 @@ def test_cagr_sharpe_drawdown_win_rate_and_profit_factor_formulas():
     equity = [100.0, 120.0, 90.0, 100.0]
     stamps = [datetime(2025, 1, 1) + timedelta(days=index) for index in range(4)]
     realized = [10.0, -5.0, 20.0]
-    metrics = cell.metrics_from_equity(stamps, equity, realized, cell.PERIODS_PER_YEAR["1h"])
+    metrics = cell.metrics_from_equity(stamps, equity, realized, cell.PERIODS_PER_YEAR["1h"], 100.0)
     returns = [0.0, 0.2, -0.25, 100.0 / 90.0 - 1.0]
     expected_sharpe = statistics.mean(returns) / statistics.stdev(returns) * (8760 ** 0.5)
     check("net return is measured on fee-inclusive equity", metrics["net_return_pct"] == 0.0,
@@ -1014,22 +1051,22 @@ def test_cagr_sharpe_drawdown_win_rate_and_profit_factor_formulas():
     check("net profit is the sum of realized cycle PnL", metrics["net_profit_usdt"] == 25.0,
           metrics["net_profit_usdt"])
     annual = [datetime(2025, 1, 1), datetime(2026, 1, 1)]
-    one_year = cell.metrics_from_equity(annual, [100.0, 110.0], [10.0], cell.PERIODS_PER_YEAR["1d"])
+    one_year = cell.metrics_from_equity(annual, [100.0, 110.0], [10.0], cell.PERIODS_PER_YEAR["1d"], 100.0)
     check("cagr is geometric over the actual elapsed year",
           abs(one_year["cagr_pct"] - 10.0) < 1e-9, one_year["cagr_pct"])
     half = cell.metrics_from_equity([annual[0], datetime(2025, 7, 2)], [100.0, 110.0], [10.0],
-                                    cell.PERIODS_PER_YEAR["1d"])
+                                    cell.PERIODS_PER_YEAR["1d"], 100.0)
     check("cagr compounds the actual elapsed time instead of reusing the return",
           half["cagr_pct"] > 19.0 and abs(half["net_return_pct"] - 10.0) < 1e-9,
           (half["cagr_pct"], half["net_return_pct"]))
-    no_loss = cell.metrics_from_equity(stamps, equity, [5.0, 3.0], cell.PERIODS_PER_YEAR["1h"])
+    no_loss = cell.metrics_from_equity(stamps, equity, [5.0, 3.0], cell.PERIODS_PER_YEAR["1h"], 100.0)
     check("profit factor is null when no cycle lost money", no_loss["profit_factor"] is None,
           no_loss["profit_factor"])
-    empty = cell.metrics_from_equity(stamps, equity, [], cell.PERIODS_PER_YEAR["4h"])
+    empty = cell.metrics_from_equity(stamps, equity, [], cell.PERIODS_PER_YEAR["4h"], 100.0)
     check("profit factor and win rate are null with no cycle",
           empty["profit_factor"] is None and empty["win_rate_pct"] is None
           and empty["total_trades"] == 0, (empty["profit_factor"], empty["win_rate_pct"]))
-    four_hour = cell.metrics_from_equity(stamps, equity, realized, cell.PERIODS_PER_YEAR["4h"])
+    four_hour = cell.metrics_from_equity(stamps, equity, realized, cell.PERIODS_PER_YEAR["4h"], 100.0)
     check("annualization follows the frozen timeframe periods per year",
           abs(four_hour["sharpe"] / metrics["sharpe"] - (2190 / 8760) ** 0.5) < 1e-12,
           (four_hour["sharpe"], metrics["sharpe"]))
@@ -1058,7 +1095,7 @@ def test_zero_trade_and_zero_volatility_evidence():
     check("an approved cost model cannot claim performance without a trade",
           cell.performance_claimable(approved, metrics) is False)
     flat = cell.metrics_from_equity([datetime(2025, 1, 1), datetime(2025, 1, 2)], [100.0, 100.0], [],
-                                    cell.PERIODS_PER_YEAR["1h"])
+                                    cell.PERIODS_PER_YEAR["1h"], 100.0)
     check("zero volatility is null sharpe, not a division", flat["sharpe"] is None, flat["sharpe"])
 
 

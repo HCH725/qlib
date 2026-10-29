@@ -318,32 +318,41 @@ REPLAY_DEFINITIONS = {
     "net_return_pct": "100 * (end_equity / start_equity - 1), fee-inclusive account equity.",
     "cagr_pct": "100 * ((end_equity / start_equity) ** (365*24*3600 / elapsed_seconds) - 1): true geometric CAGR over the actual elapsed evaluation time. Null when either end is not positive or elapsed time is not positive.",
     "sharpe": "sqrt(periods_per_year) * mean(bar_return) / stdev(bar_return, ddof=1), zero risk-free, every evaluation-window bar including flat bars. Null when fewer than 2 bars or the stdev is zero.",
-    "max_drawdown_pct": "100 * max over bars of (running peak equity - equity) / running peak equity; the peak includes the current bar; 0.0 when equity never falls.",
-    "bar_return": "equity[t] / equity[t-1] - 1; 0.0 on the first bar and on a bar whose prior equity is not positive.",
+    "max_drawdown_pct": "100 * max over bars of (running peak equity - equity) / running peak equity; the running peak is initialized from frozen initial capital before the first evaluation bar, so first-bar costs are included; 0.0 when equity never falls.",
+    "bar_return": "equity[t] / equity[t-1] - 1 for t>0; on the first evaluation bar, equity[0] / frozen_initial_capital - 1 so first-bar fees/PnL are not dropped. A non-positive prior/base equity is a HOLD.",
     "win_rate_pct": "100 * cycles with positive realized net PnL / total cycles. Null when there is no cycle.",
     "total_trades": "completed or forced long cycles replayed inside the evaluation window.",
     "profit_factor": "gross positive realized cycle net PnL / abs(gross negative realized cycle net PnL). Null when there is no cycle, or when no cycle lost money (undefined/infinite).",
-    "net_profit_usdt": "sum of realized cycle net PnL; equals end_equity - start_equity.",
+    "net_profit_usdt": "sum of realized cycle net PnL; equals end_equity - frozen initial capital after the evaluation window is forced flat.",
     "performance_claimable": "true only when the applied economics are proven equivalent to an approved research cost model AND every required promotion metric is defined (CAGR, Sharpe) AND at least one cycle was replayed. Approval alone is not enough, and funding is not applied to PnL at all, so no cell can claim net performance in this version: the flag stays false until funding actually reaches PnL.",
 }
 
 
-def bar_returns(equity):
-    """Return the per-bar simple returns of one equity series; the first bar is 0.0."""
+def bar_returns(equity, initial_capital):
+    """Return per-bar simple returns, including the first bar versus frozen initial capital."""
+    base = float(initial_capital)
+    if base <= 0:
+        raise SystemExit("HOLD: frozen initial capital must be positive")
     out = []
-    for index, value in enumerate(equity):
-        if index == 0 or equity[index - 1] <= 0:
-            out.append(0.0)
-        else:
-            out.append(value / equity[index - 1] - 1.0)
+    prior = base
+    for value in equity:
+        value = float(value)
+        if prior <= 0:
+            raise SystemExit("HOLD: equity return base became non-positive")
+        out.append(value / prior - 1.0)
+        prior = value
     return out
 
 
-def max_drawdown_pct(equity):
-    """Return peak-to-trough drawdown in percent of the running peak."""
-    peak, worst = None, 0.0
+def max_drawdown_pct(equity, initial_capital):
+    """Return peak-to-trough drawdown with the frozen initial capital as the first peak."""
+    peak = float(initial_capital)
+    if peak <= 0:
+        raise SystemExit("HOLD: frozen initial capital must be positive")
+    worst = 0.0
     for value in equity:
-        peak = value if peak is None else max(peak, value)
+        value = float(value)
+        peak = max(peak, value)
         if peak > 0:
             worst = max(worst, (peak - value) / peak * 100.0)
     return worst
@@ -554,18 +563,24 @@ def equity_projection(eval_indices, records, initial_capital):
                 "mark_pnl_quote": mark,
             }
         )
-    for bar, value in zip(projection, bar_returns([item["equity_quote"] for item in projection])):
+    for bar, value in zip(
+        projection,
+        bar_returns([item["equity_quote"] for item in projection], initial_capital),
+    ):
         bar["bar_return"] = value
     return projection
 
 
-def metrics_from_equity(timestamps, equity, realized_pnls, periods_per_year):
-    """Return the required fee-inclusive metrics plus their definitions."""
+def metrics_from_equity(timestamps, equity, realized_pnls, periods_per_year, initial_capital):
+    """Return required fee-inclusive metrics using frozen initial capital as the baseline."""
     if not equity or len(timestamps) != len(equity):
         raise SystemExit("HOLD: the evaluation window produced no usable equity series")
-    start, end = float(equity[0]), float(equity[-1])
+    start = float(initial_capital)
+    end = float(equity[-1])
+    if start <= 0:
+        raise SystemExit("HOLD: frozen initial capital must be positive")
     elapsed = (timestamps[-1] - timestamps[0]).total_seconds() if len(timestamps) > 1 else 0.0
-    returns = bar_returns(equity)
+    returns = bar_returns(equity, start)
     sharpe = None
     if len(returns) > 1:
         mean = sum(returns) / len(returns)
@@ -584,12 +599,13 @@ def metrics_from_equity(timestamps, equity, realized_pnls, periods_per_year):
         "net_return_pct": (end / start - 1.0) * 100.0,
         "cagr_pct": cagr,
         "sharpe": sharpe,
-        "max_drawdown_pct": max_drawdown_pct(equity),
+        "max_drawdown_pct": max_drawdown_pct(equity, start),
         "win_rate_pct": (100.0 * len(winners) / total) if total else None,
         "total_trades": total,
         "profit_factor": (sum(winners) / gross_loss) if losers and gross_loss > 0 else None,
         "net_profit_usdt": sum(realized_pnls),
         "start_equity_quote": start,
+        "first_observed_equity_quote": float(equity[0]),
         "end_equity_quote": end,
         "elapsed_seconds": elapsed,
         "evaluation_bars": len(equity),
@@ -1028,8 +1044,13 @@ def run_cell(cell_dir, out_dir, simulator=None):
     projection = equity_projection(eval_indices, records, float(overlay["initial_capital_quote"]))
     evaluation_times = [rows[index]["datetime"] for index in eval_indices]
     realized = [record["realized_pnl_quote"] for record in records]
-    metrics = metrics_from_equity(evaluation_times, [bar["equity_quote"] for bar in projection], realized,
-                                  PERIODS_PER_YEAR[timeframe])
+    metrics = metrics_from_equity(
+        evaluation_times,
+        [bar["equity_quote"] for bar in projection],
+        realized,
+        PERIODS_PER_YEAR[timeframe],
+        float(overlay["initial_capital_quote"]),
+    )
     cost_matches, cost_reason = applied_cost_matches_model(cfg)
     claimable = performance_claimable(cfg, metrics)
     close_reasons = {}

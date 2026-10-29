@@ -16,9 +16,11 @@ Boundary, deliberately narrow:
   artifact: one Python file with one callable ``signal()``, loaded from the
   cell directory and bound to the sha256 declared in the cell config.
 - ``research_leverage`` multiplies the house quote allocation only (base quote
-  allocation x research_leverage). It is a research exposure multiplier. It is
-  not a Binance liquidation, isolated-margin, funding or account-equity model;
-  canonical economics stay with the Node13 Hummingbot certification lane.
+  allocation x research_leverage). It is a research exposure multiplier: it is
+  not a Binance liquidation or isolated-margin account model, and it is not an
+  account-equity model. Funding is a separate charge this run applies from a
+  verified source identity (see Funding, below); canonical execution economics
+  and certification stay with the Node13 Hummingbot certification lane.
 - DCA stage semantics reuse the exported Qlib <-> Hummingbot DCA path
   (``qlib.backtest.backtest_hummingbot_dca``) over the frozen provider.
 - Every overlay parameter comes from the cell config. This file invents none:
@@ -391,7 +393,7 @@ REPLAY_DEFINITIONS = {
     "net_profit_usdt": "sum of realized cycle net PnL after fees and funding; equals end_equity - frozen initial capital after the evaluation window is forced flat.",
     "trades_csv": "one row per replayed cycle. dca_net_pnl_quote is the house DCA primitive's own fee-inclusive result, funding_paid_quote is every funding event charged to that cycle, and realized_pnl_quote = dca_net_pnl_quote - funding_paid_quote.",
     "funding_events_csv": "one row per charged funding event, in charge order: the cycle it hit, the registered funding_time, the UTC-hour boundary used, the rate, the mark price and where that mark came from, held_base_qty at that instant, and payment_quote (positive = paid out of PnL). A run that held nothing during the window writes the header only.",
-    "performance_claimable": "true only when the applied economics are proven equivalent to an approved research cost model - declared fee equals the overlay's trade_cost, declared slippage is 0.0, funding is applied from a source identity that the runtime itself re-verified including both sha256 digests, and funding reconciles with cycle PnL and account equity - AND every required promotion metric is defined (CAGR, Sharpe) AND at least one cycle was replayed. Approval alone is not enough, and an unverified or absent funding source is never treated as zero. A declared not_modeled funding block therefore keeps this false.",
+    "performance_claimable": "true only when the applied economics are proven equivalent to an approved research cost model - every declared cost is an explicit finite JSON number (null, empty, boolean, NaN/Infinity and string costs are refused, never read as zero), the declared fee equals the overlay's trade_cost, the declared slippage is exactly 0.0, funding is applied from a source identity that the runtime itself re-verified including both sha256 digests, and funding reconciles with cycle PnL and account equity - AND every required promotion metric is defined (CAGR, Sharpe) AND at least one cycle was replayed. Approval alone is not enough, and an unverified or absent funding source is never treated as zero. A declared not_modeled funding block therefore keeps this false.",
 }
 
 
@@ -506,10 +508,18 @@ def read_jsonl_gz(path, what):
 
 
 def finite_float(value, what):
-    """Return one finite float, or fail closed naming the exact field."""
+    """Return one finite float, or fail closed naming the exact field.
+
+    A JSON boolean is a malformed financial value, never 0.0/1.0: ``float``
+    silently converts it, so it is refused *before* any conversion. A decimal
+    string stays accepted and unambiguous, because the registered source format
+    carries rates as strings and a string is not a falsy cost assumption.
+    """
+    if isinstance(value, bool):
+        raise SystemExit("HOLD: funding %s is a JSON boolean, not a number: %r" % (what, value))
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise SystemExit("HOLD: funding %s is not numeric: %r" % (what, value))
     if not math.isfinite(number):
         raise SystemExit("HOLD: funding %s is not finite: %r" % (what, value))
@@ -642,6 +652,28 @@ def load_funding_series(identity, symbol, window_start_ms, window_end_ms):
     }
 
 
+def declared_cost_number(block, key, where):
+    """Return (number, None) for one declared cost, or (None, reason).
+
+    The value must be an explicit finite JSON number. ``None``, an empty or
+    non-numeric string, a JSON boolean, NaN/Infinity and a numeric string are all
+    declarations that carry no number, and this replay never invents 0.0 to fill
+    one: a falsy value is not a cost assumption, it is a missing measurement.
+    """
+    if not isinstance(block, dict) or key not in block:
+        return None, "%s does not declare %s" % (where, key)
+    value = block[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, "%s.%s is not an explicit finite JSON number: %r" % (where, key, value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None, "%s.%s is not a finite JSON number: %r" % (where, key, value)
+    if not math.isfinite(number):
+        return None, "%s.%s is not finite: %r" % (where, key, value)
+    return number, None
+
+
 def applied_cost_matches_model(cfg, applied=None):
     """Return (matches, reason) for the applied economics against the declared model.
 
@@ -657,7 +689,10 @@ def applied_cost_matches_model(cfg, applied=None):
     - the identity the run actually resolved must equal the declared one key by
       key, including both sha256 digests, so a stale manifest cannot claim a run
       that read different bytes;
-    - the declared per-side fee must be the fee the overlay really charges.
+    - the declared per-side fee must be the fee the overlay really charges;
+    - every declared cost must be an explicit finite JSON number, and the only
+      slippage the replay can match is exactly 0.0: an absent, null, empty,
+      boolean or string cost is a missing measurement, never an implied zero.
 
     Do not weaken these to make a claim true: a claim that cannot survive them is
     not a smaller claim, it is a false one.
@@ -689,15 +724,19 @@ def applied_cost_matches_model(cfg, applied=None):
     if mismatch:
         return False, ("the declared funding identity does not match the source this run applied: "
                        + ",".join(mismatch))
-    try:
-        fee = float(cost.get("fees_per_side") or 0.0)
-        slippage = float(cost.get("slippage") or 0.0)
-        trade_cost = float(overlay.get("trade_cost") or 0.0)
-    except (TypeError, ValueError):
-        return False, "declared or applied cost is not numeric"
-    if slippage != 0.0:
+    declared_costs = {}
+    for where, block, key in (
+        ("research_cost_model", cost, "fees_per_side"),
+        ("research_cost_model", cost, "slippage"),
+        ("house_overlay", overlay, "trade_cost"),
+    ):
+        number, problem = declared_cost_number(block, key, where)
+        if problem:
+            return False, problem
+        declared_costs[key] = number
+    if declared_costs["slippage"] != 0.0:
         return False, "slippage is declared but the replay applies none"
-    if fee != trade_cost:
+    if declared_costs["fees_per_side"] != declared_costs["trade_cost"]:
         return False, "the declared per-side fee is not the fee the overlay applies"
     return True, (
         "the declared model equals the applied economics: 2 * house_overlay.trade_cost per filled stage and "
@@ -1342,8 +1381,31 @@ def build_effective_config(spec, identity, artifact_sha256):
         "house_overlay": dict(spec["house_overlay"]),
         "research_cost_model": dict(spec["research_cost_model"]),
         "economics_boundary": {
+            # Every scope statement here is persisted in effective_config.json, in
+            # summary.json and (via the repro artifacts) in MLflow, so it must
+            # describe exactly what this replay does. Funding is applied, not
+            # "unmodeled": only the isolated-margin account mechanics and slippage
+            # are absent from the Qlib replay.
+            "research_leverage_scope": "exposure multiplier only: research_leverage scales every DCA stage's "
+                                       "quote allocation, so it scales exposure and PnL; it is not a margin "
+                                       "balance, a leverage maintenance rule or a liquidation model",
             "research_leverage_is_exposure_multiplier": True,
-            "isolated_margin_funding_slippage": "not modeled here; Node13 Hummingbot owns canonical economics",
+            "isolated_margin": "not modeled in this Qlib replay: no isolated-margin balance, maintenance "
+                               "margin, liquidation price or position limit is simulated, so a replay can "
+                               "never be read as a margin-account result",
+            "slippage": "not applied: every fill uses the frozen bar-close reference price of the DCA "
+                        "primitive, so a declared research cost model is equivalent only when its "
+                        "slippage is exactly 0.0 and no other slippage is ever assumed",
+            "funding": "applied from a verified structured source identity: when research_cost_model."
+                       "funding is the binance-usdm-funding-v1 identity, every held-through event is "
+                       "charged into the same bar's equity and the identity is re-verified against the "
+                       "source bytes; when it is the explicit not_modeled declaration the cell stays "
+                       "runnable with funding absent from PnL and performance_claimable false, and "
+                       "funding is never zero-filled",
+            "funding_scope": "conditional_verified_identity_else_not_modeled_unclaimable",
+            "final_execution_and_certification": "Node13 Hummingbot owns canonical execution economics, "
+                                                 "live fee/funding rates and certification; this replay is "
+                                                 "research evidence, not the certified economics",
         },
     }
 

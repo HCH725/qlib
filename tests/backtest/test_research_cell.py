@@ -26,7 +26,15 @@ local fixture:
 - cagr/sharpe/max drawdown/win rate/profit factor follow their persisted
   definitions exactly, including the zero-trade and zero-volatility cases;
 - an approved research cost model only claims performance when the applied
-  economics are mechanically equivalent to it;
+  economics are mechanically equivalent to it, and every declared cost has to be an
+  explicit finite JSON number: null, empty, boolean, non-finite and string costs are
+  refused instead of being read as an implied 0.0;
+- a malformed boolean funding rate, official mark or modeled mark open HOLDs
+  instead of being converted to 0.0/1.0, while the registered decimal-string form
+  keeps working;
+- the persisted economics boundary describes applied funding, unmodeled isolated
+  margin and unapplied slippage separately, so no persisted definition contradicts
+  a funding_applied=true run;
 - the evidence files and the manifest cover every one of those bars and cycles.
 
 No Qlib provider, no campaign run, no network. The DCA module, the cell module
@@ -673,6 +681,15 @@ def raised(function, token):
     return False
 
 
+def hold_message(function):
+    """Return the HOLD message a call raises, or None when the call does not hold."""
+    try:
+        function()
+    except SystemExit as exc:
+        return str(exc)
+    return None
+
+
 def test_research_leverage_scales_stage_exposure():
     base = spec_for()["house_overlay"]
     amounts_3 = cell.house_dca_amounts(base["base_order_quote_pct"], base["safety_order_quote_pct"],
@@ -1292,6 +1309,33 @@ def write_funding_fixture(root, rows, mark_bars=(), symbol=FUNDING_SYMBOL):
     }
 
 
+def modeled_mark_month(root, bars, symbol=FUNDING_SYMBOL):
+    """Write one or more months of 1h mark bars verbatim; return the snapshot digest map.
+
+    ``bars`` carries ``(open_time_ms, open[, close])`` where a value may be any
+    JSON value at all, so a malformed boolean or non-finite mark reaches the
+    loader exactly as the registered source would carry it.
+    """
+    per_month = {}
+    for bar in bars:
+        stamp_ms, open_price = int(bar[0]), bar[1]
+        close_price = bar[2] if len(bar) > 2 else open_price
+        month = datetime.fromtimestamp(stamp_ms / 1000.0, tz=timezone.utc)
+        per_month.setdefault((month.year, month.month), []).append((stamp_ms, open_price, close_price))
+    used = {}
+    mark_dir = Path(root) / "mark" / symbol / "1h"
+    mark_dir.mkdir(parents=True, exist_ok=True)
+    for (year, month), items in sorted(per_month.items()):
+        name = "%s-1h-%04d-%02d.jsonl.gz" % (symbol, year, month)
+        path = mark_dir / name
+        with gzip.open(path, "wt", encoding="utf-8") as handle:
+            handle.write("\n".join(
+                json.dumps({"open_time_ms": stamp, "open": open_price, "close": close_price})
+                for stamp, open_price, close_price in items) + "\n")
+        used["%s/1h/%s" % (symbol, name)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return used
+
+
 def official_event(boundary_ms, rate="0.0001", mark="100.0", **extra):
     """Return one official funding row on the frozen envelope."""
     row = {
@@ -1310,6 +1354,18 @@ def modeled_event(boundary_ms, rate="0.0001", **extra):
     row = {"funding_time_ms": boundary_ms, "funding_rate": rate, "mark_price": None,
            "truth_status": "modeled_funding", "funding_price_source": None}
     row.update(extra)
+    return row
+
+
+def malformed_event(boundary_ms, field, value):
+    """Return one official row whose named financial field carries a malformed JSON value.
+
+    Built this way on purpose: the field has to reach the loader exactly as a bad
+    source row would, including a JSON boolean, so the fixture cannot lean on a
+    helper's string formatting.
+    """
+    row = official_event(boundary_ms)
+    row[field] = value
     return row
 
 
@@ -1807,6 +1863,183 @@ def test_m_performance_claimable_requires_a_verified_applied_funding_model():
           cell.performance_claimable(legacy, legacy_run["metrics"],
                                      funding_applied_for(legacy_run, initial)) is False,
           cell.applied_cost_matches_model(legacy, funding_applied_for(legacy_run, initial)))
+
+
+def test_n_declared_costs_must_be_explicit_finite_json_numbers():
+    """B1: an unknown or invalid declared cost is never invented as 0.0.
+
+    The independent audit reproduced a ``slippage: null`` config opening a
+    performance claim on a real provider run, and empty/boolean values behaved the
+    same way. Every declared cost is therefore an explicit finite JSON number, and
+    the only slippage this replay can match is exactly 0.0. No production fee or
+    slippage number is chosen or approved here: the fixture values are the ones the
+    committed synthetic spec already carries.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-costs-n-"))
+    rows = flat_cycle_rows()
+    identity = write_funding_fixture(tmp, [official_event(funding_boundary(2))])
+    funding = load_fixture_funding(identity, rows)
+    run = replay(rows, funding=funding)
+    initial = float(run["overlay"]["initial_capital_quote"])
+    applied = funding_applied_for(run, initial)
+
+    def approved_cfg():
+        """Return the synthetic approved config whose costs the run really charges."""
+        cfg = cell_config()
+        cfg["research_cost_model"]["approved"] = True
+        cfg["research_cost_model"]["funding"] = dict(funding["identity"])
+        return cfg
+
+    cfg = approved_cfg()
+    check("the explicit-number positive control stays runnable", cell.problems_in_config(cfg) == [],
+          cell.problems_in_config(cfg))
+    matches, reason = cell.applied_cost_matches_model(cfg, applied)
+    check("an explicit 0.0 slippage with a matching fee still matches", matches is True, reason)
+    check("that control is still claimable on a real cycle",
+          cell.performance_claimable(cfg, run["metrics"], applied) is True,
+          cell.applied_cost_matches_model(cfg, applied))
+    near_zero = dict(cfg, research_cost_model=dict(cfg["research_cost_model"], slippage=1e-7))
+    check("exactly 0.0 is the only slippage value the replay can match",
+          cell.applied_cost_matches_model(near_zero, applied)[0] is False,
+          cell.applied_cost_matches_model(near_zero, applied))
+
+    invalid = (
+        (None, "null"),
+        ("", "empty string"),
+        ("0.0", "numeric string"),
+        ("abc", "non-numeric string"),
+        (False, "false"),
+        (True, "true"),
+        (float("nan"), "NaN"),
+        (float("inf"), "Infinity"),
+        (float("-inf"), "-Infinity"),
+    )
+    for where, key in (
+        ("research_cost_model", "slippage"),
+        ("research_cost_model", "fees_per_side"),
+        ("house_overlay", "trade_cost"),
+    ):
+        for value, label in invalid:
+            broken = approved_cfg()
+            broken[where][key] = value
+            matches, reason = cell.applied_cost_matches_model(broken, applied)
+            check("%s.%s as %s never matches" % (where, key, label), matches is False, (value, reason))
+            check("... the reason names the exact field", key in reason, reason)
+            check("... and the claim stays closed",
+                  cell.performance_claimable(broken, run["metrics"], applied) is False, reason)
+        absent = approved_cfg()
+        absent[where].pop(key)
+        matches, reason = cell.applied_cost_matches_model(absent, applied)
+        check("%s.%s absent never matches" % (where, key), matches is False and key in reason, reason)
+
+    null_slippage = approved_cfg()
+    null_slippage["research_cost_model"]["slippage"] = None
+    matches, reason = cell.applied_cost_matches_model(null_slippage, applied)
+    check("the audited null-slippage case is refused by the explicit-number rule",
+          matches is False and "slippage" in reason and "explicit finite JSON number" in reason, reason)
+    check("the null-slippage reason names the null value, not an implied zero",
+          "None" in reason and "or 0.0" not in reason, reason)
+
+
+def test_o_boolean_funding_numbers_hold_instead_of_zero_filling():
+    """B2: a JSON boolean is not a funding number and never becomes 0.0 or 1.0.
+
+    ``float(False) == 0.0`` and ``float(True) == 1.0``, so a malformed boolean rate
+    silently charged zero funding and a boolean mark was read as a price of 1.0.
+    Both now HOLD before any conversion, while the registered decimal-string form
+    the source actually carries keeps working.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-bool-o-"))
+    for value, label in ((False, "false"), (True, "true")):
+        rate_root = tmp / ("rate-" + label)
+        identity = write_funding_fixture(rate_root, [malformed_event(funding_boundary(2), "funding_rate", value)])
+        message = hold_message(lambda: load_fixture_funding(identity, flat_cycle_rows()))
+        check("a %s funding_rate is a HOLD, never a zero-filled charge" % label,
+              message is not None and "funding_rate" in message and "boolean" in message, message)
+        mark_root = tmp / ("mark-" + label)
+        mark_identity = write_funding_fixture(mark_root, [malformed_event(funding_boundary(2), "mark_price", value)])
+        message = hold_message(lambda: load_fixture_funding(mark_identity, flat_cycle_rows()))
+        check("a %s official mark_price is a HOLD" % label,
+              message is not None and "mark_price" in message and "boolean" in message, message)
+        modeled_root = tmp / ("modeled-" + label)
+        modeled_identity = write_funding_fixture(modeled_root, [modeled_event(funding_boundary(2))])
+        marks = modeled_mark_month(modeled_root, [(funding_boundary(2), value)])
+        modeled_identity["modeled_mark_snapshot_sha256"] = cell.modeled_mark_snapshot(marks)
+        message = hold_message(lambda: load_fixture_funding(modeled_identity, flat_cycle_rows()))
+        check("a %s modeled 1h mark open is a HOLD" % label,
+              message is not None and "mark open" in message and "boolean" in message, message)
+    for label, value in (("NaN", float("nan")), ("Infinity", float("inf"))):
+        message = hold_message(lambda: cell.finite_float(value, "funding_rate at 0"))
+        check("a %s funding_rate is a HOLD, not a number" % label,
+              message is not None and "not finite" in message, message)
+    accepted = write_funding_fixture(tmp / "string-form",
+                                     [official_event(funding_boundary(2), rate="0.0001", mark="100.0")])
+    series = load_fixture_funding(accepted, flat_cycle_rows())
+    check("the registered decimal-string rate and mark stay accepted",
+          series["events"][0]["funding_rate"] == 0.0001 and series["events"][0]["mark_price"] == 100.0,
+          series["events"])
+    run = replay(flat_cycle_rows(), funding=series)
+    check("and that string-form event still charges exactly 1.8 quote",
+          abs(run["records"][0]["funding_paid_quote"] - 1.8) < 1e-12, run["records"][0]["funding_paid_quote"])
+
+
+def test_p_persisted_economics_boundary_matches_the_applied_funding_scope():
+    """N1: the persisted boundary may not call funding unmodeled while it is applied.
+
+    The same block is written into every ``effective_config.json``, copied into the
+    run's ``summary.json`` and (through the repro artifacts) into MLflow, so it must
+    describe exactly what this replay does: leverage is an exposure multiplier,
+    isolated-margin mechanics and slippage are absent, funding is applied only from
+    a verified structured identity and is never zero-filled, and Node13 Hummingbot
+    keeps final execution economics and certification.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="research-cell-boundary-p-"))
+    spec_path = tmp / "campaign-spec.json"
+    spec_path.write_text(json.dumps(spec_for()), encoding="utf-8")
+    root = tmp / "cells"
+    manifest = cell.materialize(spec_path, root)
+    persisted_path = root / manifest["cells"][0]["cell_id"] / "effective_config.json"
+    persisted_text = persisted_path.read_text(encoding="utf-8")
+    boundary = json.loads(persisted_text)["economics_boundary"]
+    check("the effective config persists the boundary block",
+          isinstance(boundary, dict) and bool(boundary), boundary)
+    for phrase in ("isolated_margin_funding_slippage", "not modeled here", "funding not modeled",
+                   "funding is not modeled", "funding: not modeled"):
+        check("the persisted config never says %r" % phrase, phrase not in persisted_text, phrase)
+    check("the conflated single scope key is replaced by separate scopes",
+          all(key in boundary for key in ("research_leverage_scope", "isolated_margin", "slippage", "funding",
+                                          "funding_scope", "final_execution_and_certification")),
+          sorted(boundary))
+    check("research leverage is persisted as an exposure multiplier",
+          boundary["research_leverage_is_exposure_multiplier"] is True
+          and "exposure multiplier" in boundary["research_leverage_scope"],
+          boundary["research_leverage_scope"])
+    check("isolated-margin mechanics are the thing that is not modeled",
+          "not modeled" in boundary["isolated_margin"] and "liquidation" in boundary["isolated_margin"],
+          boundary["isolated_margin"])
+    check("slippage is persisted as not applied", "not applied" in boundary["slippage"], boundary["slippage"])
+    check("funding is persisted as conditional on a verified structured identity",
+          "verified" in boundary["funding"] and "not_modeled" in boundary["funding"]
+          and "zero-filled" in boundary["funding"], boundary["funding"])
+    check("the machine-readable funding scope pins that conditionality",
+          boundary["funding_scope"] == "conditional_verified_identity_else_not_modeled_unclaimable",
+          boundary["funding_scope"])
+    check("Node13 Hummingbot stays the final execution/certification owner",
+          "Node13 Hummingbot" in boundary["final_execution_and_certification"]
+          and "certification" in boundary["final_execution_and_certification"],
+          boundary["final_execution_and_certification"])
+    for key, value in boundary.items():
+        lowered = str(value).lower()
+        if "fund" in lowered:
+            check("the funding scope %r never calls funding unmodeled" % key,
+                  "not modeled" not in lowered and "not modelled" not in lowered, value)
+    summary_boundary = dict(boundary, research_cost_model=json.loads(persisted_text)["research_cost_model"],
+                            cost_model_approved=False, performance_claimable=False)
+    check("the summary copy cannot re-word the boundary",
+          all(summary_boundary[key] == boundary[key] for key in boundary), sorted(summary_boundary))
+    check("a funding_applied run's summary wording stays compatible with the persisted scope",
+          "when research_cost_model" in boundary["funding"] and "charged into the same bar's equity"
+          in boundary["funding"], boundary["funding"])
 
 
 def main():
